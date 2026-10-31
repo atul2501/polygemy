@@ -151,6 +151,7 @@ pub fn run(model_fixture: Option<&str>) -> Value {
                 fee_rate: "0.07".parse().unwrap(),
                 held: None,
                 data_ok: true,
+                entries: 0,
             },
         );
         let _ = risk.check(

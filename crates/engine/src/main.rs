@@ -388,32 +388,32 @@ async fn run(cfg: &Config) -> Result<()> {
             predictor: predict::Predictor::new(models, cfg.trading_mode.as_str()),
             sink: sink.clone(),
             health: fh.clone(),
-            trader: matches!(cfg.trading_mode, TradingMode::Paper | TradingMode::Shadow).then(
-                || {
-                    let (tx, rx) = tokio::sync::mpsc::channel(10_000);
-                    let mode = cfg.trading_mode.as_str();
-                    // Continuous live-data runs share run_id "" per mode; backtests use their own ids.
-                    trade_store = Some(tokio::spawn(pipeline::run_trade_store(
-                        pool.clone(),
+            trader: (cfg.paper_trading_enabled
+                && matches!(cfg.trading_mode, TradingMode::Paper | TradingMode::Shadow))
+            .then(|| {
+                let (tx, rx) = tokio::sync::mpsc::channel(10_000);
+                let mode = cfg.trading_mode.as_str();
+                // Continuous live-data runs share run_id "" per mode; backtests use their own ids.
+                trade_store = Some(tokio::spawn(pipeline::run_trade_store(
+                    pool.clone(),
+                    mode,
+                    String::new(),
+                    rx,
+                )));
+                pipeline::PaperTrading {
+                    trader: polygemy_engine::trading::Trader::new(
                         mode,
                         String::new(),
-                        rx,
-                    )));
-                    pipeline::PaperTrading {
-                        trader: polygemy_engine::trading::Trader::new(
-                            mode,
-                            String::new(),
-                            Default::default(),
-                            Default::default(),
-                            Default::default(),
-                        ),
-                        required: required_for_trading.clone(),
-                        records: tx,
-                        kill_switch: true, // until first read from the database
-                        meta: Default::default(),
-                    }
-                },
-            ),
+                        Default::default(),
+                        Default::default(),
+                        Default::default(),
+                    ),
+                    required: required_for_trading.clone(),
+                    records: tx,
+                    kill_switch: true, // until first read from the database
+                    meta: Default::default(),
+                }
+            }),
         };
         tasks.push(tokio::spawn(pipe.run(
             bus.subscribe(),

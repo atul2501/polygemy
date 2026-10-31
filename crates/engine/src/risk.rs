@@ -86,7 +86,7 @@ pub struct Context<'a> {
     /// Best ask of the outcome (buys) or best bid (sells).
     pub best_price: Option<Decimal>,
     pub positions: &'a Positions,
-    /// Realized PnL so far (all time) and current unrealized PnL.
+    /// Realized PnL so far (all time, net of fees) and current unrealized PnL.
     pub realized_total: Decimal,
     pub unrealized_total: Decimal,
 }
@@ -398,6 +398,7 @@ mod tests {
                 fee_rate: d("0.07"),
                 held: None,
                 data_ok: true,
+                entries: 0,
             },
         );
         assert_eq!(x.action, Action::BuyUp);
@@ -597,6 +598,48 @@ mod tests {
             matches!(r.check(&buy(4), &next), Verdict::Approved(_)),
             "new UTC day resets the daily loss"
         );
+    }
+
+    /// Found in paper trading: fees alone must be able to trip the daily-loss limit.
+    #[test]
+    fn daily_loss_counts_fees() {
+        let mut p = Positions::default();
+        // Ten round trips at the same price: zero gross PnL, but fees paid.
+        for i in 0..10 {
+            let m = format!("m{i}");
+            p.fill(
+                &m,
+                Outcome::Up,
+                FillSide::Buy,
+                d("100"),
+                d("0.5"),
+                d("1.75"),
+                0,
+            )
+            .unwrap();
+            p.fill(
+                &m,
+                Outcome::Up,
+                FillSide::Sell,
+                d("100"),
+                d("0.5"),
+                d("1.75"),
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(p.realized_total(), Decimal::ZERO);
+        let mut r = RiskEngine::new(RiskLimits::default());
+        let mut c = ctx(&p);
+        r.check(&buy(1), &c); // establishes the day at zero
+        c.realized_total = p.realized_total() - p.fees_total(); // what the trader now passes: -35
+        assert!(matches!(
+            r.check(&buy(2), &c),
+            Verdict::Rejected {
+                rule: "circuit_breaker",
+                ..
+            }
+        ));
     }
 
     #[test]

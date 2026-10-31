@@ -323,6 +323,8 @@ pub struct Trader {
     idx: FeatureIndex,
     /// Last persisted non-order decision per market (throttles NO_TRADE/HOLD records).
     quiet: HashMap<String, (String, i64)>,
+    /// Approved entries per market (the strategy limits re-entries).
+    entries: HashMap<String, u32>,
     fee_rates: HashMap<String, Decimal>,
 }
 
@@ -345,6 +347,7 @@ impl Trader {
             exec: SimExecutor::new(sim),
             idx: FeatureIndex::default(),
             quiet: HashMap::new(),
+            entries: HashMap::new(),
             fee_rates: HashMap::new(),
         }
     }
@@ -379,17 +382,13 @@ impl Trader {
                         condition_id: cid.clone(),
                         entries,
                     });
-                    if let Some(p) = self.positions.get(&cid).cloned().or_else(|| {
-                        Some(crate::positions::Position {
-                            condition_id: cid.clone(),
-                            outcome,
-                            shares: Decimal::ZERO,
-                            cost: Decimal::ZERO,
-                            fees: Decimal::ZERO,
-                            realized: Decimal::ZERO,
-                            opened_us: f.ts_us,
-                        })
-                    }) {
+                    // `get` hides fully closed positions; the record must still carry their realized PnL and fees.
+                    if let Some(p) = self
+                        .positions
+                        .all()
+                        .find(|p| p.condition_id == cid)
+                        .cloned()
+                    {
                         out.push(TradeRecord::Position {
                             condition_id: cid,
                             outcome,
@@ -457,6 +456,7 @@ impl Trader {
             fee_rate,
             held,
             data_ok: !row.degraded && env.feeds_ok,
+            entries: self.entries.get(&row.condition_id).copied().unwrap_or(0),
         };
         let mut d = decide(&self.strategy, &inputs);
         if settlement.is_none() && d.action == Action::NoTrade {
@@ -502,7 +502,8 @@ impl Trader {
                 data_age_ms: self.idx.data_age_ms(&row.features),
                 best_price: best,
                 positions: &self.positions,
-                realized_total: self.positions.realized_total(),
+                // Net of fees: the loss breakers must see what was actually paid.
+                realized_total: self.positions.realized_total() - self.positions.fees_total(),
                 unrealized_total: unrealized,
             };
             let verdict = self.risk.check(&d, &ctx);
@@ -513,6 +514,9 @@ impl Trader {
             });
             match verdict {
                 Verdict::Approved(intent) => {
+                    if intent.side == FillSide::Buy {
+                        *self.entries.entry(row.condition_id.clone()).or_default() += 1;
+                    }
                     out.push(TradeRecord::Risk {
                         ts_us: row.ts_us,
                         condition_id: row.condition_id.clone(),

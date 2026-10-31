@@ -418,7 +418,10 @@ mod tests {
         assert_eq!(m.predict(&x).0, 0.5, "no price to beat yet: no opinion");
         for z in [-3.0, -1.0, 0.0, 0.7, 2.5] {
             x[zi] = z;
-            assert!((m.predict(&x).0 - crate::features::indicators::norm_cdf(z)).abs() < 0.01, "z {z}");
+            assert!(
+                (m.predict(&x).0 - crate::features::indicators::norm_cdf(z)).abs() < 0.01,
+                "z {z}"
+            );
         }
     }
 

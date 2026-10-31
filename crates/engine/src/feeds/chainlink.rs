@@ -250,8 +250,16 @@ mod tests {
     /// Found by the real-data replay check: midpoints must round like PostgreSQL NUMERIC.
     #[test]
     fn rounds_like_postgres_numeric() {
-        let v = |s: &str| point_value(&json!({"full_accuracy_value": s})).unwrap().to_string();
-        assert_eq!(v("77304.030964845"), "77304.03096485", "half away from zero, not to even");
+        let v = |s: &str| {
+            point_value(&json!({"full_accuracy_value": s}))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            v("77304.030964845"),
+            "77304.03096485",
+            "half away from zero, not to even"
+        );
         assert_eq!(v("77304.030964835"), "77304.03096484");
         assert_eq!(v("77304.030964834999"), "77304.03096483");
     }

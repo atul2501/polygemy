@@ -62,12 +62,19 @@ pub struct StrategyConfig {
     pub max_spread: Decimal,
     pub min_order_shares: Decimal,
     pub tick: Decimal,
+    /// An early exit must beat holding by at least this much per share, after the exit fee
+    /// (round trips cost ~2 taker fees plus the spread).
+    pub exit_margin: Decimal,
+    /// New entries allowed per market (re-entering after an exit churns fees).
+    pub max_entries_per_market: u32,
 }
 
 impl Default for StrategyConfig {
     fn default() -> Self {
         StrategyConfig {
-            min_edge: Decimal::new(2, 2),
+            min_edge: Decimal::new(4, 2),
+            exit_margin: Decimal::new(3, 2),
+            max_entries_per_market: 1,
             safety_margin: 0.02,
             uncertainty_k: 2.0,
             stake_usd: Decimal::from(5),
@@ -111,6 +118,8 @@ pub struct Inputs<'a> {
     pub held: Option<(Outcome, Decimal)>,
     /// Data is fresh and complete (feature quality valid, required feeds healthy).
     pub data_ok: bool,
+    /// Entries already made in this market.
+    pub entries: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,7 +267,7 @@ pub fn decide(cfg: &StrategyConfig, i: &Inputs) -> Decision {
         let mut proceeds = Decimal::ZERO;
         let mut fees = Decimal::ZERO;
         for (px, size) in &book.bids {
-            if *px - fee(Decimal::ONE, *px, i.fee_rate) - dec(p) < cfg.min_edge {
+            if *px - fee(Decimal::ONE, *px, i.fee_rate) - dec(p) < cfg.exit_margin {
                 break;
             }
             let take = (*size).min(held - sellable);
@@ -295,6 +304,16 @@ pub fn decide(cfg: &StrategyConfig, i: &Inputs) -> Decision {
         return d;
     }
 
+    if i.entries >= cfg.max_entries_per_market {
+        return Decision::base(
+            i,
+            Action::NoTrade,
+            format!(
+                "already entered this market {} time(s); limit {}",
+                i.entries, cfg.max_entries_per_market
+            ),
+        );
+    }
     if i.time_remaining_s < cfg.min_time_remaining_s {
         return Decision::base(
             i,
@@ -409,6 +428,7 @@ mod tests {
             fee_rate: d("0.07"),
             held: None,
             data_ok: true,
+            entries: 0,
         }
     }
 
@@ -449,16 +469,16 @@ mod tests {
         // p 0.60 -> 0.58 after haircut; ask 0.58 => edge negative after fee. Down: 0.40-0.02=0.38 < 0.43.
         let x = decide(&StrategyConfig::default(), &inputs(0.60, &up, &down));
         assert_eq!(x.action, Action::NoTrade);
-        assert!(x.explanation.contains("no 0.02 edge"), "{}", x.explanation);
+        assert!(x.explanation.contains("no 0.04 edge"), "{}", x.explanation);
     }
 
     #[test]
     fn uncertainty_widens_the_haircut() {
         let up = book(&[("0.49", "100")], &[("0.50", "100")]);
         let down = book(&[("0.40", "100")], &[("0.60", "100")]);
-        let mut i = inputs(0.56, &up, &down);
+        let mut i = inputs(0.60, &up, &down);
         assert_eq!(decide(&StrategyConfig::default(), &i).action, Action::BuyUp);
-        i.p_se = 0.02; // haircut 0.02 + 2*0.02 = 0.06 -> 0.50 => no edge
+        i.p_se = 0.02; // haircut 0.02 + 2*0.02 = 0.06 -> 0.54: 0.54 - 0.50 - fee 0.0175 < 0.04
         assert_eq!(
             decide(&StrategyConfig::default(), &i).action,
             Action::NoTrade
@@ -508,6 +528,35 @@ mod tests {
             decide(&StrategyConfig::default(), &i).action,
             Action::Hold,
             "never panic-sell on bad data"
+        );
+    }
+
+    #[test]
+    fn one_entry_per_market_and_exits_need_the_margin() {
+        let up = book(&[("0.49", "100")], &[("0.50", "100")]);
+        let down = book(&[("0.40", "100")], &[("0.60", "100")]);
+        let mut i = inputs(0.70, &up, &down);
+        assert_eq!(decide(&StrategyConfig::default(), &i).action, Action::BuyUp);
+        i.entries = 1;
+        let x = decide(&StrategyConfig::default(), &i);
+        assert_eq!(x.action, Action::NoTrade, "no re-entry after the first one");
+        assert!(x.explanation.contains("already entered"));
+        // Holding Up with fair value 0.58: a bid of 0.60 beats holding by 0.02 - fee 0.0168 < 0.03 margin => hold.
+        let small = book(&[("0.60", "100")], &[("0.61", "100")]);
+        let mut h = inputs(0.60, &small, &down);
+        h.held = Some((Outcome::Up, d("10")));
+        assert_eq!(
+            decide(&StrategyConfig::default(), &h).action,
+            Action::Hold,
+            "exit gain too small for the round-trip cost"
+        );
+        // A bid of 0.65: 0.65 - fee 0.0159 - 0.58 = 0.054 >= 0.03 => sell.
+        let rich = book(&[("0.65", "100")], &[("0.66", "100")]);
+        let mut h2 = inputs(0.60, &rich, &down);
+        h2.held = Some((Outcome::Up, d("10")));
+        assert_eq!(
+            decide(&StrategyConfig::default(), &h2).action,
+            Action::SellAll
         );
     }
 

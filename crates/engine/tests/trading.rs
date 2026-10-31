@@ -170,6 +170,63 @@ fn fills_only_on_a_later_book_with_fak_and_settles_exactly() {
     );
 }
 
+/// Found in paper trading: a fully closed position must still be recorded with its PnL and fees.
+#[test]
+fn closed_positions_keep_realized_pnl_and_fees() {
+    let mut t = trader(SimConfig::default());
+    let mut meta = HashMap::new();
+    t.on_row(
+        &row("m", T0, 0.50, 100.0, 0.49),
+        Some((&pred("m", T0, 0.65), Some(1))),
+        &ENV,
+        &mut meta,
+    );
+    t.on_row(
+        &row("m", T0 + S, 0.50, 100.0, 0.49),
+        Some((&pred("m", T0 + S, 0.65), Some(2))),
+        &ENV,
+        &mut meta,
+    );
+    assert!(t.positions.get("m").is_some(), "bought");
+    // The bid jumps far above fair value: sell everything, then the sell fills on the next book.
+    t.on_row(
+        &row("m", T0 + 2 * S, 0.80, 100.0, 0.79),
+        Some((&pred("m", T0 + 2 * S, 0.40), Some(3))),
+        &ENV,
+        &mut meta,
+    );
+    let r = t.on_row(
+        &row("m", T0 + 3 * S, 0.80, 100.0, 0.79),
+        Some((&pred("m", T0 + 3 * S, 0.40), Some(4))),
+        &ENV,
+        &mut meta,
+    );
+    assert!(t.positions.get("m").is_none(), "fully closed");
+    let last = r
+        .iter()
+        .rev()
+        .find_map(|x| {
+            if let TradeRecord::Position {
+                shares,
+                realized,
+                fees,
+                ..
+            } = x
+            {
+                Some((*shares, *realized, *fees))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(last.0.is_zero());
+    assert!(
+        last.1 > Decimal::ZERO,
+        "realized PnL of the round trip is recorded, not zeroed"
+    );
+    assert!(last.2 > Decimal::ZERO, "fees are recorded");
+}
+
 #[test]
 fn venue_rejections_trip_the_breaker_and_kill_switch_stops_orders() {
     let mut t = trader(SimConfig {

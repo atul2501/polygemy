@@ -58,6 +58,8 @@ pub struct Config {
     pub market_data_enabled: bool,
     pub prediction_enabled: bool,
     pub risk_engine_enabled: bool,
+    /// Simulated trading in paper/shadow mode. When false, features and predictions still run.
+    pub paper_trading_enabled: bool,
     pub log_format: LogFormat,
     pub log_level: String,
     pub feeds: Feeds,
@@ -288,6 +290,10 @@ impl Config {
                 "RISK_ENGINE_ENABLED",
                 &or("RISK_ENGINE_ENABLED", "true"),
             )?,
+            paper_trading_enabled: parse_bool(
+                "PAPER_TRADING_ENABLED",
+                &or("PAPER_TRADING_ENABLED", "true"),
+            )?,
             log_format: pick(
                 "LOG_FORMAT",
                 &or("LOG_FORMAT", "json"),
@@ -332,6 +338,7 @@ impl Config {
             "market_data_enabled": self.market_data_enabled,
             "prediction_enabled": self.prediction_enabled,
             "risk_engine_enabled": self.risk_engine_enabled,
+            "paper_trading_enabled": self.paper_trading_enabled,
             "feeds_enabled": self.feeds.enabled,
             "required_feeds": self.feeds.required,
             "polymarket_api_credentials": self.feeds.poly_api.is_some(),
@@ -408,6 +415,17 @@ mod tests {
         assert!(cfg(&[("DATABASE_URL", "sqlite://x.db")]).is_err());
         assert!(cfg(&[("DB_MAX_CONNECTIONS", "0")]).is_err());
         assert!(cfg(&[("DATABASE_URL", "")]).is_err());
+    }
+
+    #[test]
+    fn paper_trading_switch() {
+        assert!(cfg(&[]).unwrap().paper_trading_enabled, "default on");
+        assert!(
+            !cfg(&[("PAPER_TRADING_ENABLED", "false")])
+                .unwrap()
+                .paper_trading_enabled
+        );
+        assert!(cfg(&[("PAPER_TRADING_ENABLED", "no")]).is_err());
     }
 
     #[test]
