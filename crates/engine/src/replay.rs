@@ -81,7 +81,14 @@ type SnapRow = (
     Value,
     Value,
 );
-type MarketRow = (String, DateTime<Utc>, DateTime<Utc>, Option<String>, String, String);
+type MarketRow = (
+    String,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    Option<String>,
+    String,
+    String,
+);
 type ReportRow = (
     String,
     String,

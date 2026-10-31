@@ -1,3 +1,4 @@
+pub mod backtest;
 pub mod book;
 pub mod clock;
 pub mod config;
@@ -10,9 +11,13 @@ pub mod market;
 pub mod monitor;
 pub mod persist;
 pub mod pipeline;
+pub mod positions;
 pub mod predict;
 pub mod replay;
+pub mod risk;
+pub mod strategy;
 pub mod telemetry;
+pub mod trading;
 pub mod ws;
 
 /// Package version plus the git commit baked in at build time (see docker/engine.Dockerfile).

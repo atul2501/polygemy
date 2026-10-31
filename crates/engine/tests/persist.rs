@@ -89,9 +89,12 @@ async fn events_are_persisted_exactly_and_deduplicated() {
     );
     let (recv, proc, persisted): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
         sqlx::query_as("SELECT received_ts, processed_ts, persisted_ts FROM exchange_events WHERE symbol = $1 LIMIT 1").bind(&sym).fetch_one(&pool).await.unwrap();
+    // receive/process come from this process's clock; persisted_ts from the database server's.
+    // Only same-clock timestamps are ordered strictly; across clocks allow for their offset.
+    assert!(recv <= proc, "receive <= process (same clock)");
     assert!(
-        recv <= proc && proc <= persisted,
-        "timestamps are ordered: receive <= process <= persist"
+        (persisted - proc).num_milliseconds().abs() < 2000,
+        "persisted within clock tolerance of processing"
     );
 }
 

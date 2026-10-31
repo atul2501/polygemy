@@ -6,6 +6,9 @@
   python -m polygemy.research rollback HORIZON
   python -m polygemy.research retire   HORIZON
   python -m polygemy.research list
+  python -m polygemy.research metrics  RUN_ID [--mode backtest]
+  python -m polygemy.research walkforward --data data/ds1 --engine ../target/release/polygemy-engine [--groups combined,technical,...]
+  python -m polygemy.research sync     --source URL --from 2026-11-01 --to 2026-11-08   (into DATABASE_URL)
 
 DATABASE_URL selects the database (local, or Stockholm through an SSH tunnel).
 """
@@ -19,7 +22,7 @@ from pathlib import Path
 
 import psycopg
 
-from . import dataset, models, registry, train
+from . import backtest, dataset, models, registry, train
 
 
 def ts(s: str) -> datetime:
@@ -46,6 +49,19 @@ def main(argv=None) -> int:
     for name in ("promote", "rollback", "retire"):
         sub.add_parser(name).add_argument("target")
     sub.add_parser("list")
+    mt = sub.add_parser("metrics")
+    mt.add_argument("target")
+    mt.add_argument("--mode", default="backtest")
+    w = sub.add_parser("walkforward")
+    w.add_argument("--data", type=Path, required=True)
+    w.add_argument("--engine", required=True)
+    w.add_argument("--groups", default="combined")
+    w.add_argument("--splits", type=int, default=4)
+    w.add_argument("--min-train-markets", type=int, default=20)
+    sy = sub.add_parser("sync")
+    sy.add_argument("--source", required=True)
+    sy.add_argument("--from", dest="start", type=ts, required=True)
+    sy.add_argument("--to", dest="end", type=ts, required=True)
     a = p.parse_args(argv)
 
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
@@ -78,6 +94,19 @@ def main(argv=None) -> int:
         elif a.cmd == "retire":
             registry.retire(conn, a.target)
             print(f"no approved model for {a.target}")
+        elif a.cmd == "metrics":
+            print(json.dumps(backtest.trading_metrics(conn, a.mode, a.target), indent=2, default=str))
+        elif a.cmd == "walkforward":
+            df, manifest = dataset.load(a.data)
+            df.attrs["feature_version"] = manifest["feature_version"]
+            rep = backtest.walkforward(conn, df, a.engine, manifest["version"], tuple(a.groups.split(",")), a.splits, a.min_train_markets)
+            out = a.data / "walkforward.json"
+            out.write_text(json.dumps(rep, indent=2, default=str))
+            print(json.dumps(rep["by_group"], indent=2, default=str))
+            print(f"report: {out}")
+        elif a.cmd == "sync":
+            with psycopg.connect(a.source) as src:
+                print(json.dumps(backtest.sync(src, conn, a.start, a.end), indent=2))
         elif a.cmd == "list":
             for r in conn.execute("SELECT version, status, created_at, approved_at, metrics->>'brier', metrics->>'n' FROM model_versions ORDER BY horizon, created_at"):
                 print(*r)

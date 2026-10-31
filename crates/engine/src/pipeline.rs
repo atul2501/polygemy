@@ -13,7 +13,12 @@ use crate::clock::now_us;
 use crate::features::{FeatureEngine, MarketCtx};
 use crate::health::FeedHealth;
 use crate::persist::{FeatureRow, Record, Sink};
+use crate::positions::FillSide;
 use crate::predict::{load_approved, Predictor};
+use crate::strategy::Outcome;
+use crate::trading::{Env, TradeRecord, Trader};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
 
 pub struct Pipeline {
     pub pool: PgPool,
@@ -22,6 +27,18 @@ pub struct Pipeline {
     pub sink: Sink,
     /// Health of the feature/prediction stage itself ("features").
     pub health: Arc<FeedHealth>,
+    /// Paper/shadow trading on live features (None in development mode).
+    pub trader: Option<PaperTrading>,
+}
+
+/// Live paper (or shadow) trading state inside the pipeline.
+pub struct PaperTrading {
+    pub trader: Trader,
+    /// Feeds that must be healthy before any entry.
+    pub required: Vec<Arc<FeedHealth>>,
+    pub records: mpsc::Sender<Vec<TradeRecord>>,
+    pub kill_switch: bool,
+    pub meta: HashMap<String, (String, Outcome, FillSide)>,
 }
 
 /// Max of the settlement-stream age and the Polymarket book age (ms), from the row itself.
@@ -48,6 +65,7 @@ impl Pipeline {
         self.health.on_connected();
         self.engine.set_markets(markets.borrow().clone());
         let mut reload = tokio::time::interval(Duration::from_secs(60));
+        let mut housekeeping = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
                 r = bus.recv() => match r {
@@ -77,6 +95,7 @@ impl Pipeline {
                         self.health.on_error(format!("model load: {e:#}"));
                     }
                 },
+                _ = housekeeping.tick(), if self.trader.is_some() => self.housekeeping().await,
                 _ = shutdown.changed() => break,
             }
         }
@@ -95,10 +114,112 @@ impl Pipeline {
             let t = now_us();
             self.health
                 .on_message(t, None, t + compute_us, !row.degraded);
-            for p in self.predictor.predict(&row, data_age_ms(&row)) {
+            let preds = self.predictor.predict(&row, data_age_ms(&row));
+            if let Some(pt) = self.trader.as_mut() {
+                let env = Env {
+                    kill_switch: pt.kill_switch,
+                    feeds_ok: pt.required.iter().all(|h| h.usable()),
+                };
+                let settlement = preds
+                    .iter()
+                    .find(|p| p.horizon == "settlement")
+                    .map(|p| (p, None));
+                let recs = pt.trader.on_row(&row, settlement, &env, &mut pt.meta);
+                if !recs.is_empty() && pt.records.try_send(recs).is_err() {
+                    // Audit records must not be lost: stop trading rather than continue unrecorded.
+                    pt.trader
+                        .risk
+                        .halt("trade records cannot be persisted (writer backlog)".into());
+                    self.health
+                        .on_error("trade record backlog: trading halted".into());
+                }
+            }
+            for p in preds {
                 self.sink.send(Record::Prediction(p), &self.health);
             }
             self.sink.send(Record::Features(row), &self.health);
+        }
+    }
+
+    /// Off the record path every 5 s: kill switch and settlement of open positions.
+    async fn housekeeping(&mut self) {
+        let Some(pt) = self.trader.as_mut() else {
+            return;
+        };
+        match sqlx::query_scalar::<_, bool>("SELECT engaged FROM kill_switch WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(k) => {
+                if k != pt.kill_switch {
+                    warn!(engaged = k, "kill switch changed");
+                }
+                pt.kill_switch = k;
+            }
+            // Unknown state is treated as engaged.
+            Err(e) => {
+                pt.kill_switch = true;
+                warn!(
+                    error = format!("{e:#}"),
+                    "kill switch unreadable; treating as engaged"
+                );
+            }
+        }
+        let open: Vec<String> = pt
+            .trader
+            .positions
+            .open()
+            .map(|p| p.condition_id.clone())
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let rows: Vec<(String, Option<String>)> = match sqlx::query_as(
+            "SELECT condition_id, official_outcome FROM market_lifecycles WHERE condition_id = ANY($1)",
+        )
+        .bind(&open)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return warn!(error = format!("{e:#}"), "settlement poll failed"),
+        };
+        for (cid, outcome) in rows {
+            let w = match outcome.as_deref() {
+                Some("Up") => Outcome::Up,
+                Some("Down") => Outcome::Down,
+                _ => continue,
+            };
+            let recs = pt.trader.settle(&cid, w, now_us());
+            info!(
+                condition_id = cid,
+                winner = w.as_str(),
+                "paper position settled"
+            );
+            if pt.records.send(recs).await.is_err() {
+                pt.trader.risk.halt("trade record writer stopped".into());
+            }
+        }
+    }
+}
+
+/// Writes trade records in order; retries until stored (never drops financial records).
+pub async fn run_trade_store(
+    pool: PgPool,
+    mode: &'static str,
+    run_id: String,
+    mut rx: mpsc::Receiver<Vec<TradeRecord>>,
+) {
+    while let Some(batch) = rx.recv().await {
+        let mut backoff = Duration::from_millis(500);
+        while let Err(e) = crate::trading::store(&pool, mode, &run_id, &batch).await {
+            warn!(
+                error = format!("{e:#}"),
+                retry_ms = backoff.as_millis() as u64,
+                "trade record write failed"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
 }

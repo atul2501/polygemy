@@ -55,6 +55,46 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
         }
         "run" => run(cfg).await,
         "status" => status(cfg).await,
+        "backtest" => {
+            let arg = |i: usize| std::env::args().nth(i);
+            let time = |i: usize| -> Result<i64> {
+                let s = arg(i).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?;
+                polygemy_engine::clock::parse_rfc3339_us(&s)
+                    .ok_or_else(|| anyhow::anyhow!("not an RFC 3339 time: {s}"))
+            };
+            let env_f = |k: &str, d: f64| {
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(d)
+            };
+            let mut strategy = polygemy_engine::strategy::StrategyConfig::default();
+            if let Ok(v) = std::env::var("STRATEGY_MIN_EDGE") {
+                strategy.min_edge = v.parse()?;
+            }
+            strategy.safety_margin = env_f("STRATEGY_SAFETY_MARGIN", strategy.safety_margin);
+            let cfg_bt = polygemy_engine::backtest::BacktestConfig {
+                run_id: arg(5).unwrap_or_else(|| format!("bt-{}", uuid::Uuid::new_v4().simple())),
+                from_us: time(2)?,
+                to_us: time(3)?,
+                model_version: arg(4).filter(|m| !m.is_empty() && m != "approved"),
+                strategy,
+                limits: polygemy_engine::risk::RiskLimits::default(),
+                sim: polygemy_engine::trading::SimConfig {
+                    latency_us: (env_f("SIM_LATENCY_MS", 1000.0) * 1000.0) as i64,
+                    reject_rate: env_f("SIM_REJECT_RATE", 0.0),
+                    ..Default::default()
+                },
+            };
+            let pool = db::connect(&cfg.database_url, 2).await?;
+            let s = polygemy_engine::backtest::run(&pool, &cfg_bt).await?;
+            println!(
+                "run_id {}\n{}",
+                cfg_bt.run_id,
+                serde_json::to_string_pretty(&s)?
+            );
+            Ok(())
+        }
         "replay" => {
             let arg = |i: usize| -> Result<i64> {
                 let s = std::env::args()
@@ -134,6 +174,7 @@ async fn run(cfg: &Config) -> Result<()> {
     };
     let mut healths: Vec<Arc<FeedHealth>> = Vec::new();
     let mut tasks = Vec::new();
+    let mut trade_store: Option<tokio::task::JoinHandle<()>> = None;
 
     if cfg.market_data_enabled {
         if f.on("binance") {
@@ -267,6 +308,8 @@ async fn run(cfg: &Config) -> Result<()> {
         ));
 
         let fh = health("features");
+        let required_for_trading: Vec<Arc<FeedHealth>> =
+            healths.iter().filter(|h| h.required).cloned().collect();
         let models = predict::load_approved(&pool).await.unwrap_or_else(|e| {
             warn!(
                 error = format!("{e:#}"),
@@ -292,6 +335,32 @@ async fn run(cfg: &Config) -> Result<()> {
             predictor: predict::Predictor::new(models, cfg.trading_mode.as_str()),
             sink: sink.clone(),
             health: fh.clone(),
+            trader: matches!(cfg.trading_mode, TradingMode::Paper | TradingMode::Shadow).then(
+                || {
+                    let (tx, rx) = tokio::sync::mpsc::channel(10_000);
+                    let mode = cfg.trading_mode.as_str();
+                    // Continuous live-data runs share run_id "" per mode; backtests use their own ids.
+                    trade_store = Some(tokio::spawn(pipeline::run_trade_store(
+                        pool.clone(),
+                        mode,
+                        String::new(),
+                        rx,
+                    )));
+                    pipeline::PaperTrading {
+                        trader: polygemy_engine::trading::Trader::new(
+                            mode,
+                            String::new(),
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                        ),
+                        required: required_for_trading.clone(),
+                        records: tx,
+                        kill_switch: true, // until first read from the database
+                        meta: Default::default(),
+                    }
+                },
+            ),
         };
         tasks.push(tokio::spawn(pipe.run(
             bus.subscribe(),
@@ -328,6 +397,14 @@ async fn run(cfg: &Config) -> Result<()> {
             .is_err()
         {
             warn!("a task did not stop within 10 s");
+        }
+    }
+    if let Some(t) = trade_store {
+        if tokio::time::timeout(Duration::from_secs(20), t)
+            .await
+            .is_err()
+        {
+            warn!("trade record writer did not drain within 20 s");
         }
     }
     // All senders are gone now; the writer flushes what is queued and exits.
