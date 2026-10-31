@@ -10,6 +10,8 @@ pub mod polymarket;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::broadcast;
+
 use rust_decimal::Decimal;
 
 use serde_json::Value;
@@ -34,6 +36,8 @@ pub struct Ctx {
     pub store_book_deltas: bool,
     /// Last stored best bid/ask per symbol: a BBO is only persisted when a price changes.
     last_bbo: Arc<Mutex<HashMap<String, TopOfBook>>>,
+    /// Every persisted record is also published here for the feature engine.
+    bus: Option<broadcast::Sender<Arc<Record>>>,
 }
 
 impl Ctx {
@@ -43,7 +47,22 @@ impl Ctx {
             health,
             store_book_deltas,
             last_bbo: Arc::default(),
+            bus: None,
         }
+    }
+
+    pub fn with_bus(mut self, bus: broadcast::Sender<Arc<Record>>) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// Persist a record and publish it to the bus. Exactly what is stored is what features see.
+    pub fn persist(&self, r: Record) {
+        if let Some(bus) = &self.bus {
+            // No receivers is fine (e.g. features disabled); lagging receivers count their own loss.
+            let _ = bus.send(Arc::new(r.clone()));
+        }
+        self.sink.send(r, &self.health);
     }
 
     /// Small-storage filter: drop book deltas unless enabled, and BBOs whose prices did not change.
@@ -75,7 +94,7 @@ impl Ctx {
         self.health
             .on_message(e.received_us, latency_ts, e.processed_us, valid);
         if self.should_store(&e) {
-            self.sink.send(Record::Event(e), &self.health);
+            self.persist(Record::Event(e));
         }
     }
 
@@ -94,12 +113,13 @@ impl Ctx {
             symbol: symbol.to_string(),
             market_id: market_id.map(str::to_string),
             ts_us,
+            received_us: crate::clock::now_us(),
             seq: book.last_seq,
             bids,
             asks,
             reason,
         };
-        self.sink.send(Record::Snapshot(snap), &self.health);
+        self.persist(Record::Snapshot(snap));
     }
 }
 

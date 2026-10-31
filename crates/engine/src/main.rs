@@ -12,12 +12,13 @@ use polygemy_engine::market::discovery::Discovery;
 use polygemy_engine::market::manager::{Manager, ManagerConfig};
 use polygemy_engine::monitor::Monitor;
 use polygemy_engine::persist::{self, WriterStats};
-use polygemy_engine::{build_version, telemetry, ws};
+use polygemy_engine::{build_version, features, pipeline, predict, telemetry, ws};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-const USAGE: &str = "usage: polygemy-engine <migrate|check|run|status>";
+const USAGE: &str =
+    "usage: polygemy-engine <migrate|check|run|status|replay FROM TO>  (FROM/TO as RFC 3339)";
 
 #[tokio::main]
 async fn main() {
@@ -54,6 +55,29 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
         }
         "run" => run(cfg).await,
         "status" => status(cfg).await,
+        "replay" => {
+            let arg = |i: usize| -> Result<i64> {
+                let s = std::env::args()
+                    .nth(i)
+                    .ok_or_else(|| anyhow::anyhow!("{USAGE}"))?;
+                polygemy_engine::clock::parse_rfc3339_us(&s)
+                    .ok_or_else(|| anyhow::anyhow!("not an RFC 3339 time: {s}"))
+            };
+            let (from, to) = (arg(2)?, arg(3)?);
+            let pool = db::connect(&cfg.database_url, 2).await?;
+            let f = &cfg.feeds;
+            let symbols = features::Symbols {
+                binance: f.binance_symbol.clone(),
+                coinbase: f.coinbase_product.clone(),
+                deribit: f.deribit_instrument.clone(),
+            };
+            let started = std::time::Instant::now();
+            let rows = polygemy_engine::replay::replay_features(&pool, symbols, from, to).await?;
+            let c = polygemy_engine::replay::compare_with_stored(&pool, &rows, from, to).await?;
+            info!(elapsed_s = started.elapsed().as_secs_f64(), comparison = ?c, "replay finished");
+            println!("{c:#?}");
+            Ok(())
+        }
         _ => bail!("{USAGE}"),
     }
 }
@@ -97,6 +121,9 @@ async fn run(cfg: &Config) -> Result<()> {
     let writer_stats = Arc::new(WriterStats::default());
     let writer = tokio::spawn(persist::run_writer(pool.clone(), rx, writer_stats.clone()));
 
+    pipeline::register_feature_version(&pool).await?;
+    let (bus, _) = tokio::sync::broadcast::channel(16_384);
+    let (windows_tx, windows_rx) = watch::channel(Vec::new());
     let stale = Duration::from_millis(f.stale_after_ms);
     let health = |name: &'static str| {
         Arc::new(FeedHealth::new(
@@ -112,7 +139,7 @@ async fn run(cfg: &Config) -> Result<()> {
         if f.on("binance") {
             let h = health("binance");
             let s = Binance::new(
-                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas).with_bus(bus.clone()),
                 f.binance_ws_url.clone(),
                 f.binance_rest_url.clone(),
                 f.binance_symbol.clone(),
@@ -124,7 +151,7 @@ async fn run(cfg: &Config) -> Result<()> {
         if f.on("coinbase") {
             let h = health("coinbase");
             let s = Coinbase::new(
-                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas).with_bus(bus.clone()),
                 f.coinbase_ws_url.clone(),
                 f.coinbase_product.clone(),
             );
@@ -134,7 +161,7 @@ async fn run(cfg: &Config) -> Result<()> {
         if f.on("deribit") {
             let h = health("deribit");
             let s = Deribit::new(
-                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas).with_bus(bus.clone()),
                 f.deribit_ws_url.clone(),
                 f.deribit_instrument.clone(),
                 f.deribit_extra_tickers.clone(),
@@ -156,7 +183,8 @@ async fn run(cfg: &Config) -> Result<()> {
                             passphrase: pass.clone(),
                         };
                         let s = Chainlink::new(
-                            Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
+                            Ctx::new(sink.clone(), h.clone(), f.store_book_deltas)
+                                .with_bus(bus.clone()),
                             f.polybolt_ws_url.clone(),
                             creds,
                             stream,
@@ -183,7 +211,7 @@ async fn run(cfg: &Config) -> Result<()> {
                 stale.max(Duration::from_secs(15)),
             ));
             let s = Polymarket::new(
-                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas).with_bus(bus.clone()),
                 f.polymarket_ws_url.clone(),
                 poly_state.clone(),
             );
@@ -234,7 +262,43 @@ async fn run(cfg: &Config) -> Result<()> {
             required,
             discovery_health,
         );
-        tasks.push(tokio::spawn(manager.run(stop_rx.clone())));
+        tasks.push(tokio::spawn(
+            manager.with_windows(windows_tx).run(stop_rx.clone()),
+        ));
+
+        let fh = health("features");
+        let models = predict::load_approved(&pool).await.unwrap_or_else(|e| {
+            warn!(
+                error = format!("{e:#}"),
+                "no usable approved models; features are recorded, no predictions"
+            );
+            Vec::new()
+        });
+        info!(
+            models = models.len(),
+            feature_version = features::FEATURE_VERSION,
+            "feature pipeline starting"
+        );
+        let pipe = pipeline::Pipeline {
+            pool: pool.clone(),
+            engine: features::FeatureEngine::new(
+                features::Symbols {
+                    binance: f.binance_symbol.clone(),
+                    coinbase: f.coinbase_product.clone(),
+                    deribit: f.deribit_instrument.clone(),
+                },
+                instance_id.clone(),
+            ),
+            predictor: predict::Predictor::new(models, cfg.trading_mode.as_str()),
+            sink: sink.clone(),
+            health: fh.clone(),
+        };
+        tasks.push(tokio::spawn(pipe.run(
+            bus.subscribe(),
+            windows_rx,
+            stop_rx.clone(),
+        )));
+        healths.push(fh);
     }
 
     let monitor = Monitor {

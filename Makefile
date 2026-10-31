@@ -50,4 +50,4 @@ test-rust:
 	cargo test --workspace
 
 test-python:
-	cd python && uv run pytest -q
+	cd python && uv run --extra research pytest -q

@@ -228,7 +228,7 @@ impl Session for Chainlink {
             self.ctx
                 .health
                 .on_message(rx.wall_us, exch, processed, r.quality == Quality::Valid);
-            self.ctx.sink.send(Record::Chainlink(r), &self.ctx.health);
+            self.ctx.persist(Record::Chainlink(r));
         }
         Ok(())
     }

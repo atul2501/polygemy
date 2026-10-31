@@ -18,6 +18,7 @@ use super::repo;
 use super::validate::{validate, Methodology, Validated, Validation};
 use crate::clock::now_us;
 use crate::db::{self, Event};
+use crate::features::MarketCtx;
 use crate::feeds::chainlink::Stream;
 use crate::feeds::polymarket::PolyHandle;
 use crate::health::FeedHealth;
@@ -55,6 +56,8 @@ pub struct Manager {
     /// Health of the discovery API itself.
     pub discovery_health: Arc<FeedHealth>,
     markets: HashMap<String, Tracked>,
+    /// Market windows for the feature engine (every validated market, any state).
+    windows_tx: Option<watch::Sender<Vec<MarketCtx>>>,
 }
 
 impl Manager {
@@ -79,7 +82,41 @@ impl Manager {
             required,
             discovery_health,
             markets: HashMap::new(),
+            windows_tx: None,
         }
+    }
+
+    pub fn with_windows(mut self, tx: watch::Sender<Vec<MarketCtx>>) -> Self {
+        self.windows_tx = Some(tx);
+        self
+    }
+
+    fn publish_windows(&self) {
+        let Some(tx) = &self.windows_tx else { return };
+        let mut v: Vec<MarketCtx> = self
+            .markets
+            .values()
+            .filter_map(|t| match &t.validation {
+                Validation::Valid(x) => Some(MarketCtx {
+                    condition_id: t.meta.condition_id.clone(),
+                    start_us: x.start_us,
+                    end_us: x.end_us,
+                    up_token: x.up_token.clone(),
+                    down_token: x.down_token.clone(),
+                    twap: x.methodology == Methodology::ChainlinkTwap60,
+                }),
+                _ => None,
+            })
+            .collect();
+        v.sort_by(|a, b| a.condition_id.cmp(&b.condition_id));
+        tx.send_if_modified(|cur| {
+            if *cur != v {
+                *cur = v;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
@@ -114,6 +151,7 @@ impl Manager {
                 }
             }
             self.step_all().await;
+            self.publish_windows();
         }
         info!("lifecycle manager stopped");
     }

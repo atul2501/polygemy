@@ -24,6 +24,8 @@ pub struct BookSnapshot {
     pub symbol: String,
     pub market_id: Option<String>,
     pub ts_us: i64,
+    /// Local arrival time (replay ordering).
+    pub received_us: i64,
     pub seq: Option<i64>,
     pub bids: Value,
     pub asks: Value,
@@ -50,6 +52,49 @@ pub enum Record {
     Event(MarketEvent),
     Snapshot(BookSnapshot),
     Chainlink(ChainlinkReport),
+    Features(FeatureRow),
+    Prediction(PredictionRow),
+}
+
+impl Record {
+    /// Local arrival time: the order in which the feature engine applies records, live and in replay.
+    pub fn received_us(&self) -> i64 {
+        match self {
+            Record::Event(e) => e.received_us,
+            Record::Snapshot(s) => s.received_us,
+            Record::Chainlink(c) => c.received_us,
+            Record::Features(f) => f.ts_us,
+            Record::Prediction(p) => p.ts_us,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureRow {
+    pub ts_us: i64,
+    pub condition_id: String,
+    pub feature_version: i16,
+    pub features: Vec<f64>,
+    pub missing: i16,
+    pub degraded: bool,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PredictionRow {
+    pub ts_us: i64,
+    pub condition_id: String,
+    pub horizon: &'static str,
+    pub model_version: String,
+    pub feature_version: i16,
+    pub p_up: f64,
+    pub expected_move: Option<f64>,
+    pub volatility: Option<f64>,
+    pub uncertainty: Option<f64>,
+    pub degraded: bool,
+    pub data_age_ms: Option<i32>,
+    pub latency_us: i32,
+    pub mode: &'static str,
 }
 
 /// Writer-side statistics, reported as the `persistence` feed in latency metrics.
@@ -273,11 +318,15 @@ async fn write_batch(pool: &PgPool, batch: &[Record]) -> Result<()> {
     let mut events = Vec::new();
     let mut snaps = Vec::new();
     let mut reports = Vec::new();
+    let mut features = Vec::new();
+    let mut preds = Vec::new();
     for r in batch {
         match r {
             Record::Event(e) => events.push(e),
             Record::Snapshot(s) => snaps.push(s),
             Record::Chainlink(c) => reports.push(c),
+            Record::Features(f) => features.push(f),
+            Record::Prediction(p) => preds.push(p),
         }
     }
     let mut tx = pool.begin().await?;
@@ -314,7 +363,7 @@ async fn write_batch(pool: &PgPool, batch: &[Record]) -> Result<()> {
     }
     if !snaps.is_empty() {
         let mut q: QueryBuilder<Postgres> = QueryBuilder::new(
-            "INSERT INTO orderbook_snapshots (snapshot_ts, source, symbol, market_id, seq, bids, asks, reason) ",
+            "INSERT INTO orderbook_snapshots (snapshot_ts, source, symbol, market_id, seq, bids, asks, reason, received_ts) ",
         );
         q.push_values(snaps, |mut b, s| {
             b.push_bind(to_datetime(s.ts_us))
@@ -324,7 +373,8 @@ async fn write_batch(pool: &PgPool, batch: &[Record]) -> Result<()> {
                 .push_bind(s.seq)
                 .push_bind(&s.bids)
                 .push_bind(&s.asks)
-                .push_bind(s.reason);
+                .push_bind(s.reason)
+                .push_bind(to_datetime(s.received_us));
         });
         q.push(" ON CONFLICT DO NOTHING");
         q.build().execute(&mut *tx).await?;
@@ -346,6 +396,46 @@ async fn write_batch(pool: &PgPool, batch: &[Record]) -> Result<()> {
                 .push_bind(c.from_snapshot)
                 .push_bind(c.carried_forward)
                 .push_bind(c.quality.as_str());
+        });
+        q.push(" ON CONFLICT DO NOTHING");
+        q.build().execute(&mut *tx).await?;
+    }
+    if !features.is_empty() {
+        let mut q: QueryBuilder<Postgres> = QueryBuilder::new(
+            "INSERT INTO feature_snapshots (ts, condition_id, feature_version, features, missing, quality, instance_id) ",
+        );
+        q.push_values(features, |mut b, f| {
+            b.push_bind(to_datetime(f.ts_us))
+                .push_bind(&f.condition_id)
+                .push_bind(f.feature_version)
+                .push_bind(&f.features)
+                .push_bind(f.missing)
+                .push_bind(if f.degraded { "degraded" } else { "valid" })
+                .push_bind(&f.instance_id);
+        });
+        q.push(" ON CONFLICT DO NOTHING");
+        q.build().execute(&mut *tx).await?;
+    }
+    if !preds.is_empty() {
+        let mut q: QueryBuilder<Postgres> = QueryBuilder::new(
+            "INSERT INTO predictions (ts, condition_id, horizon, model_version, feature_version, p_up, p_down, expected_move, \
+             volatility, uncertainty, quality, data_age_ms, latency_us, mode) ",
+        );
+        q.push_values(preds, |mut b, p| {
+            b.push_bind(to_datetime(p.ts_us))
+                .push_bind(&p.condition_id)
+                .push_bind(p.horizon)
+                .push_bind(&p.model_version)
+                .push_bind(p.feature_version)
+                .push_bind(p.p_up)
+                .push_bind(1.0 - p.p_up)
+                .push_bind(p.expected_move)
+                .push_bind(p.volatility)
+                .push_bind(p.uncertainty)
+                .push_bind(if p.degraded { "degraded" } else { "valid" })
+                .push_bind(p.data_age_ms)
+                .push_bind(p.latency_us)
+                .push_bind(p.mode);
         });
         q.push(" ON CONFLICT DO NOTHING");
         q.build().execute(&mut *tx).await?;

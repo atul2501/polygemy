@@ -8,6 +8,19 @@ dependencies = [
     "psycopg-pool>=3.2,<4",
 ]
 
+[project.optional-dependencies]
+# Model research and training (local PC only; production inference runs in Rust).
+research = [
+    "numpy>=2.1,<3",
+    "pandas>=2.2,<3",
+    "pyarrow>=18,<22",
+    "scikit-learn>=1.5,<2",
+    "lightgbm>=4.5,<5",
+    "xgboost>=2.1,<4",
+    "catboost>=1.2,<2",
+    "hmmlearn>=0.3.3,<0.4",
+]
+
 [dependency-groups]
 dev = ["pytest>=8,<9"]
 

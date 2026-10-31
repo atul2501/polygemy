@@ -29,6 +29,19 @@ pub enum TradingMode {
     Live,
 }
 
+impl TradingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TradingMode::Development => "development",
+            TradingMode::Backtest => "backtest",
+            TradingMode::Replay => "replay",
+            TradingMode::Paper => "paper",
+            TradingMode::Shadow => "shadow",
+            TradingMode::Live => "live",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Json,
@@ -100,13 +113,14 @@ impl std::fmt::Debug for Feeds {
 
 pub const ALL_FEEDS: [&str; 5] = ["binance", "coinbase", "deribit", "chainlink", "polymarket"];
 /// Names that feed health reports under (chainlink runs two streams).
-pub const HEALTH_NAMES: [&str; 6] = [
+pub const HEALTH_NAMES: [&str; 7] = [
     "binance",
     "coinbase",
     "deribit",
     "chainlink_spot",
     "chainlink_twap60",
     "polymarket",
+    "features",
 ];
 
 impl Feeds {
