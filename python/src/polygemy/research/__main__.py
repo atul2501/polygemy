@@ -12,6 +12,8 @@
   python -m polygemy.research sync     --source URL --from 2026-11-01 --to 2026-11-08   (into DATABASE_URL)
   python -m polygemy.research history-download --days 14 --out data/history   (public historical markets)
   python -m polygemy.research history-eval --data data/history [--kind lightgbm]  (out-of-sample vs market + backtest)
+  python -m polygemy.research wallets-fetch --data data/history --days 14   (public trades with wallets, both sides)
+  python -m polygemy.research wallets-rank  --data data/history [--no-fee]  (real profit per wallet)
 
 DATABASE_URL selects the database (local, or Stockholm through an SSH tunnel).
 """
@@ -26,7 +28,7 @@ from pathlib import Path
 import pandas as pd
 import psycopg
 
-from . import backtest, dataset, history, models, registry, train
+from . import backtest, dataset, history, models, registry, train, wallets
 
 
 def ts(s: str) -> datetime:
@@ -79,7 +81,24 @@ def main(argv=None) -> int:
     he = sub.add_parser("history-eval")
     he.add_argument("--data", type=Path, default=Path("data/history"))
     he.add_argument("--kind", default="lightgbm")
+    wf = sub.add_parser("wallets-fetch")
+    wf.add_argument("--data", type=Path, default=Path("data/history"))
+    wf.add_argument("--days", type=int, default=14)
+    wr = sub.add_parser("wallets-rank")
+    wr.add_argument("--data", type=Path, default=Path("data/history"))
+    wr.add_argument("--no-fee", action="store_true")
+    wr.add_argument("--min-markets", type=int, default=200)
+    wr.add_argument("--top", type=int, default=25)
     a = p.parse_args(argv)
+    if a.cmd == "wallets-fetch":
+        wallets.fetch(a.data, a.days, log=lambda s: print(s, flush=True))
+        return 0
+    if a.cmd == "wallets-rank":
+        w = wallets.rank(a.data, fee=not a.no_fee, min_markets=a.min_markets, log=lambda s: print(s, flush=True))
+        w.to_parquet(a.data / "wallet_rank.parquet")
+        with pd.option_context("display.width", 250, "display.max_columns", 20):
+            print(w.head(a.top).round(3).to_string())
+        return 0
     if a.cmd == "history-download":  # public data only; needs no database
         history.download(a.out, a.days, a.series, a.symbol, a.window, log=lambda s: print(s, flush=True))
         return 0

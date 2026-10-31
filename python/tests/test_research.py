@@ -213,3 +213,22 @@ def test_maker_fills_only_when_a_trade_prints_through_the_bid(tmp_path):
     trades([(t0 + 5, 0.52, 5.0, 5.0)])
     t = history.maker_backtest(snaps.assign(p=0.40), tmp_path)
     assert len(t) == 1 and t.side.iloc[0] == "Down" and t.price.iloc[0] == 0.49 and t.pnl.iloc[0] < 0
+
+
+def test_wallet_pnl_taker_maker_and_split():
+    import pandas as pd
+
+    from polygemy.research import wallets
+
+    ts = pd.Timestamp("2026-10-01T00:01:00Z")
+    t = pd.DataFrame([
+        ("A", True, True, 0.4, 10.0, ts, True),    # taker buys 10 Up at 0.40
+        ("B", True, False, 0.6, 10.0, ts, False),  # maker buys the 10 Down at 0.60 (mint)
+        ("C", False, True, 0.5, 5.0, ts, False),   # sells 5 Up and 5 Down it split from $5
+        ("C", False, False, 0.5, 5.0, ts, False),
+    ], columns=["wallet", "buy", "up", "price", "size", "ts", "taker"])
+    p = wallets.market_pnl(t, up_won=True).set_index("wallet").pnl
+    assert abs(p["A"] - (10 - 4 - 0.07 * 0.4 * 0.6 * 10)) < 1e-9
+    assert abs(p["B"] - (-6.0)) < 1e-9
+    assert abs(p["C"]) < 1e-9  # +$5 from sales, -$5 for the split pairs, nothing left to settle
+    assert abs(wallets.market_pnl(t, up_won=True, fee=False).set_index("wallet").pnl["A"] - 6.0) < 1e-9
