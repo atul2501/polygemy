@@ -12,7 +12,7 @@ export GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 COMPOSE := docker compose --env-file $(ENV_FILE)
 ENGINE := cargo run -q -p polygemy-engine --
 
-.PHONY: db-up up down ps logs migrate check run test test-rust test-python
+.PHONY: db-up up down ps logs migrate check run status test test-rust test-python
 
 db-up:            ## start PostgreSQL only and wait until healthy
 	$(COMPOSE) up -d --wait postgres
@@ -37,6 +37,9 @@ check: db-up      ## config valid + schema current
 
 run: migrate      ## run the engine on the host (Ctrl-C for graceful stop)
 	$(ENGINE) run
+
+status:           ## feed health and recent markets from the database
+	$(ENGINE) status
 
 test: db-up       ## all tests against the disposable polygemy_test database
 	$(COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc "SELECT 1 FROM pg_database WHERE datname = '"'"'polygemy_test'"'"'" | grep -q 1 || createdb -U $$POSTGRES_USER polygemy_test'

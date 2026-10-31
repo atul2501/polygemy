@@ -1,6 +1,15 @@
+pub mod book;
+pub mod clock;
 pub mod config;
 pub mod db;
+pub mod event;
+pub mod feeds;
+pub mod health;
+pub mod market;
+pub mod monitor;
+pub mod persist;
 pub mod telemetry;
+pub mod ws;
 
 /// Package version plus the git commit baked in at build time (see docker/engine.Dockerfile).
 pub fn build_version() -> String {

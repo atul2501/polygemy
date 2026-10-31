@@ -2,13 +2,15 @@
 
 An event-driven trading engine for Polymarket's 5-minute BTC Up/Down markets. You develop and research on your PC, and a Stockholm VPS runs it in production. Both use the same code, the same Docker images, and the same PostgreSQL migration history.
 
-> Status: **Phase 1 (foundation)**. There is no market data, strategy or order code yet. The engine refuses to start in `live` mode.
+> Status: **Phase 2 (market infrastructure)**. Market discovery, the lifecycle state machine, and data collectors for Binance, Coinbase, Deribit, Chainlink and Polymarket CLOB are built; there is no prediction, strategy or order code yet. The engine refuses to start in `live` mode.
+>
+> See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md), which covers setup, Stockholm deployment, credentials and troubleshooting.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `crates/engine` | Rust engine (`polygemy-engine migrate \| check \| run`): config validation, JSON logs, Postgres pool, embedded migrations, graceful shutdown |
+| `crates/engine` | Rust engine (`polygemy-engine migrate \| check \| run \| status`): collectors (`feeds/`), market discovery/lifecycle (`market/`), WebSocket manager (`ws.rs`), async persistence (`persist.rs`), feed health (`health.rs`, `monitor.rs`) |
 | `python/` | Python package `polygemy`: research/ML now, FastAPI management API later. Reads the same env vars |
 | `migrations/` | The single SQL migration history. Only the engine applies it. Python verifies it |
 | `docker-compose.yml` | `postgres`, one-shot `migrate`, and `engine`. The same file serves both environments |
@@ -35,6 +37,7 @@ Requirements: Docker, Rust ≥ 1.85, `uv`, and GNU make.
 cp .env.example .env.local        # set a real POSTGRES_PASSWORD in all three places
 make test                         # starts Postgres, creates/migrates polygemy_test, runs Rust + Python tests
 make run                          # migrate + run engine on the host, Ctrl-C stops it gracefully
+make status                       # feed health + recent markets
 make up / make ps / make logs / make down   # the full stack in Docker
 ```
 

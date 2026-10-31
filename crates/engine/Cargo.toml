@@ -6,9 +6,16 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
-serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json", "uuid"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+chrono = "0.4.45"
+fastrand = "2.5.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+rust_decimal = "1.43.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json", "uuid", "chrono", "rust_decimal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
