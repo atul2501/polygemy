@@ -12,7 +12,7 @@ export GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 COMPOSE := docker compose --env-file $(ENV_FILE)
 ENGINE := cargo run -q -p polygemy-engine --
 
-.PHONY: db-up up down ps logs migrate check run status test test-rust test-python
+.PHONY: db-up up down ps logs migrate check run status test test-rust test-python test-dashboard dashboard api
 
 db-up:            ## start PostgreSQL only and wait until healthy
 	$(COMPOSE) up -d --wait postgres
@@ -44,10 +44,19 @@ status:           ## feed health and recent markets from the database
 test: db-up       ## all tests against the disposable polygemy_test database
 	$(COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc "SELECT 1 FROM pg_database WHERE datname = '"'"'polygemy_test'"'"'" | grep -q 1 || createdb -U $$POSTGRES_USER polygemy_test'
 	DATABASE_URL=$(TEST_DATABASE_URL) $(ENGINE) migrate
-	$(MAKE) test-rust test-python
+	$(MAKE) test-rust test-python test-dashboard
 
 test-rust:
 	cargo test --workspace
 
+test-dashboard:
+	cd dashboard && npm ci --no-audit --no-fund && npm run lint && npm run build
+
+dashboard:        ## build the dashboard (served by the API)
+	cd dashboard && npm ci --no-audit --no-fund && npm run build
+
+api:              ## run the API + dashboard on 127.0.0.1:8000
+	cd python && uv run --extra api python -m polygemy.api serve
+
 test-python:
-	cd python && uv run --extra research pytest -q
+	cd python && uv run --extra research --extra api pytest -q

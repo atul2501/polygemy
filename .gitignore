@@ -9,3 +9,5 @@ node_modules/
 !.env.example
 *.secrets
 /backups/
+dashboard/node_modules/
+dashboard/dist/

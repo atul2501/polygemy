@@ -9,17 +9,18 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
 | 2 Market infrastructure | done | `5ace1d9` |
 | Credentials script + small-storage mode | done | `f8794a9` |
 | 3 Features and prediction | done (real-data replay check pending, see below) | see git log |
-| 4 Strategy, positions, risk | **in progress** | |
-| 6 Simulation | not started | |
-| 5 Execution | not started | |
-| 7 Dashboard | not started | |
+| 4 Strategy, positions, risk | done | `5891f91` |
+| 6 Simulation | done | `5891f91`, `49bf12a` |
+| 5 Execution | done; live order path deliberately not enabled | `7ada4af` |
+| 7 Dashboard | **in progress** | |
 | 8 AWS / DevOps | not started | |
 | 9 Integration and validation | not started | |
 
 ## Test results
 
 - Before Phase 3: 61 Rust, 9 Python, 3 credential-script tests.
-- After Phase 3: **79 Rust, 17 Python** (plus the 3 credential-script tests). All passing; clippy clean.
+- After Phase 3: 79 Rust, 17 Python.
+- After Phase 5: **113 Rust, 19 Python** (plus the 3 credential-script tests). All passing; clippy clean (default and `--features live`).
 
 ## Phase 3 summary
 
@@ -38,6 +39,28 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
 - **Pending:**
   - replay vs stored comparison on real data (needs the engine to run beyond the 10 min warm-up)
   - a real model, which needs days of labelled data
+
+## Phases 4–6 summary
+
+- **Strategy** compares EV against the book: official fee, uncertainty-widened safety margin, all six decision types with explanations.
+- **Positions** use exact decimals and a double-entry ledger. A view lists any unbalanced transactions; it has always been empty.
+- **Risk** is the only path to orders:
+  - kill switch; breakers for daily loss, drawdown and execution failures
+  - health gates, duplicate guard
+  - caps that only ever shrink an order
+- **Simulation** fills FAK orders against the next snapshot after the latency, with no passive fills and seeded rejects.
+- **Backtest** runs over durable snapshots and is deterministic. Each run is isolated; unsettled markets are reported, never assumed.
+- **Walk-forward** (Python): train per fold, register a candidate, Rust backtests out of sample, feature-group ablation.
+- **Paper trading** runs in the live pipeline: kill switch polled every 5 s, settlement from official outcomes, and an ordered record writer that halts trading rather than drop records.
+- **Execution:**
+  - state machine; uncertain submissions are blocked and reconciled, never retried
+  - PostgreSQL lease with one winner out of 8 concurrent acquirers
+  - 12-item readiness checklist
+  - official SDK adapter behind `--features live`
+  - live mode refused
+- **Real-data replay check** found two real problems, both fixed:
+  - Chainlink precision was not canonical
+  - indicator values depended on engine uptime: 20-minute warm-up added, and replay now starts at the engine start
 
 ## Data collection
 
@@ -59,4 +82,4 @@ Continuous paper-mode collection on the local PC started 31 Oct 2026 ~07:40 UTC 
 
 ## Next step
 
-Phase 4: `strategy.rs` (EV with the official fee formula and a walk of the book), `positions.rs` plus the `pnl_ledger`, and `risk.rs` (the only path to execution, with the kill switch). Migration `0005`.
+Phase 7: FastAPI (auth, roles, read endpoints, audited kill switch, live WebSocket) plus the React/TS dashboard. Migration `0007`.

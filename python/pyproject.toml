@@ -9,6 +9,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Management API and dashboard backend (runs on Stockholm next to the engine).
+api = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "argon2-cffi>=23.1,<26",
+    "psutil>=6,<8",
+    "httpx>=0.27,<1",
+]
 # Model research and training (local PC only; production inference runs in Rust).
 research = [
     "numpy>=2.1,<3",
