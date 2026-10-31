@@ -1,4 +1,5 @@
 pub mod backtest;
+pub mod bench;
 pub mod book;
 pub mod clock;
 pub mod config;

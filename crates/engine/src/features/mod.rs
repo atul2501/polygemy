@@ -349,6 +349,7 @@ pub struct FeatureEngine {
     degraded: bool,
     pub late_records: u64,
     warm_from_us: Option<i64>,
+    warmup_us: i64,
 }
 
 impl FeatureEngine {
@@ -372,6 +373,7 @@ impl FeatureEngine {
             degraded: false,
             late_records: 0,
             warm_from_us: None,
+            warmup_us: WARMUP_US,
         }
     }
 
@@ -403,6 +405,11 @@ impl FeatureEngine {
         }
     }
 
+    /// Overrides the warm-up (tests). Live and replay use `WARMUP_US`.
+    pub fn set_warmup(&mut self, us: i64) {
+        self.warmup_us = us;
+    }
+
     /// Bus loss: the next snapshots are marked degraded.
     pub fn mark_lagged(&mut self) {
         self.degraded = true;
@@ -411,7 +418,7 @@ impl FeatureEngine {
     /// Adds a record; returns the feature rows of every second boundary passed by the watermark.
     pub fn push(&mut self, r: Arc<Record>) -> Vec<FeatureRow> {
         let t = r.received_us();
-        self.warm_from_us.get_or_insert(t + WARMUP_US);
+        self.warm_from_us.get_or_insert(t + self.warmup_us);
         self.max_seen = self.max_seen.max(t);
         self.seq += 1;
         self.pending.insert((t, self.seq), r);

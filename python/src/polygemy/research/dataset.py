@@ -38,6 +38,8 @@ def short_horizon_labels(snap_ts: pd.Series, reports: pd.DataFrame, horizon_s: i
     out = np.full(len(snap_ts), np.nan)
     if reports.empty or len(snap_ts) == 0:
         return out
+    # psycopg yields Etc/UTC timestamps, pandas UTC: normalise or merge_asof refuses to match.
+    reports = reports.assign(observed_ts=pd.to_datetime(reports["observed_ts"], utc=True), received_ts=pd.to_datetime(reports["received_ts"], utc=True))
     q = pd.DataFrame({"ts": pd.to_datetime(snap_ts.values, utc=True), "i": np.arange(len(snap_ts))}).sort_values("ts")
     known = pd.merge_asof(q, reports.sort_values("received_ts"), left_on="ts", right_on="received_ts", direction="backward")
     known["t"] = known["observed_ts"] + pd.Timedelta(seconds=horizon_s)

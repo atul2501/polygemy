@@ -43,6 +43,14 @@ def test_short_horizon_labels_use_arrived_reports_and_future_source_time():
     assert np.isnan(y2[0])
 
 
+def test_labels_accept_database_timezones():
+    # Found on real data: the database returns Etc/UTC, pandas builds UTC.
+    t = pd.Timestamp("2026-01-01", tz="UTC")
+    rep = pd.DataFrame({"observed_ts": [t - pd.Timedelta(seconds=2), t + pd.Timedelta(seconds=7)], "received_ts": [t - pd.Timedelta(seconds=1), t + pd.Timedelta(seconds=10)], "value": [1.0, 2.0]})
+    rep = rep.assign(observed_ts=rep["observed_ts"].dt.tz_convert("Etc/UTC"), received_ts=rep["received_ts"].dt.tz_convert("Etc/UTC"))
+    assert dataset.short_horizon_labels(pd.Series([t]), rep, 10)[0] == 1.0
+
+
 def test_walk_forward_is_chronological_purged_and_embargoed():
     df = synthetic(n_markets=30)
     seen_test = set()

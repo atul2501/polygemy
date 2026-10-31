@@ -55,6 +55,14 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
         }
         "run" => run(cfg).await,
         "status" => status(cfg).await,
+        "bench" => {
+            let fixture = std::env::args().nth(2);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&polygemy_engine::bench::run(fixture.as_deref()))?
+            );
+            Ok(())
+        }
         "live-check" => {
             let pool = db::connect(&cfg.database_url, 1).await?;
             let (ok, missing) = polygemy_engine::execution::readiness_complete(&pool).await?;
