@@ -19,7 +19,8 @@ use crate::persist::{FeatureRow, Record};
 use indicators::{norm_cdf, Bar, Indicators, Ring};
 
 /// Bump whenever a feature's meaning or the column order changes.
-pub const FEATURE_VERSION: i16 = 1;
+/// v2: settlement TWAP model (twap_end_mean/sd, twap_window_observed, p_twap_settle, logit_p_twap).
+pub const FEATURE_VERSION: i16 = 2;
 const SECOND: i64 = 1_000_000;
 /// Indicator bars (seconds of arrival time).
 const BAR_US: i64 = 5 * SECOND;
@@ -329,6 +330,45 @@ fn lead_lag(x: &Ring, y: &Ring, lag: usize) -> f64 {
     cov / (vx * vy).sqrt()
 }
 
+/// P(TWAP_end >= price to beat) for TWAP_end ~ N(mean, sd^2). A tie resolves Up (measure zero).
+pub fn settle_probability(ptb: f64, mean: f64, sd: f64) -> f64 {
+    if !(ptb.is_finite() && mean.is_finite() && sd.is_finite()) {
+        return f64::NAN;
+    }
+    if sd <= 0.0 {
+        return if mean >= ptb { 1.0 } else { 0.0 };
+    }
+    1.0 - norm_cdf((ptb - mean) / sd)
+}
+
+/// Log-odds, clipped to [1e-4, 1 - 1e-4] so a model input never becomes infinite.
+pub fn logit(p: f64) -> f64 {
+    if !p.is_finite() {
+        return f64::NAN;
+    }
+    let q = p.clamp(1e-4, 1.0 - 1e-4);
+    (q / (1.0 - q)).ln()
+}
+
+/// Mean and sd of the end TWAP when the last observation is `t` seconds before the window end,
+/// with `observed_mean` the average of the observations already inside the final 60 s window.
+/// Brownian motion with per-second sd `sigma` (absolute price units):
+///   t >= 60: TWAP_end ~ N(spot, sigma^2 (t - 40))              (average of W over [t - 60, t])
+///   t < 60:  TWAP_end = ((60 - t) * observed_mean + t * (spot + avg W over [0, t])) / 60,
+///            sd = (t / 60) * sigma * sqrt(t / 3)
+pub fn twap_end_gaussian(spot: f64, observed_mean: f64, t: f64, sigma: f64) -> (f64, f64) {
+    let t = t.max(0.0);
+    if t >= 60.0 {
+        (spot, sigma * (t - 40.0).sqrt())
+    } else {
+        let k = 60.0 - t;
+        (
+            (k * observed_mean + t * spot) / 60.0,
+            (t / 60.0) * sigma * (t / 3.0).sqrt(),
+        )
+    }
+}
+
 pub struct FeatureEngine {
     symbols: Symbols,
     instance_id: String,
@@ -627,6 +667,39 @@ impl FeatureEngine {
         }
     }
 
+    /// (mean, sd, observed fraction) of the end-of-window TWAP from the Chainlink spot reports that
+    /// have arrived. sigma blends the 60 s and 300 s per-second volatility (variance average) so a
+    /// briefly calm minute does not make the model overconfident.
+    fn twap_end_distribution(&self, end_us: i64) -> (f64, f64, f64) {
+        let Some((obs_us, _, spot)) = self.cl_spot.last() else {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        };
+        let (v60, v300) = (vol(&self.cl_spot.px_1s, 60), vol(&self.cl_spot.px_1s, 300));
+        let var_bps = match (v60.is_finite(), v300.is_finite()) {
+            (true, true) => (v60 * v60 + v300 * v300) / 2.0,
+            (true, false) => v60 * v60,
+            (false, true) => v300 * v300,
+            (false, false) => return (f64::NAN, f64::NAN, f64::NAN),
+        };
+        let sigma = spot * var_bps.sqrt() / 1e4;
+        let t = (end_us - obs_us) as f64 / 1e6;
+        let window_start = end_us - 60 * SECOND;
+        let inside: Vec<f64> = self
+            .cl_spot
+            .reports
+            .iter()
+            .filter(|r| r.0 >= window_start && r.0 <= obs_us)
+            .map(|r| r.2)
+            .collect();
+        let observed_mean = if inside.is_empty() {
+            spot
+        } else {
+            inside.iter().sum::<f64>() / inside.len() as f64
+        };
+        let (mean, sd) = twap_end_gaussian(spot, observed_mean, t, sigma);
+        (mean, sd, ((60.0 - t.max(0.0)) / 60.0).clamp(0.0, 1.0))
+    }
+
     fn compute(&self, s: i64, m: &MarketCtx) -> F {
         let mut f = F {
             names: Vec::with_capacity(220),
@@ -694,6 +767,15 @@ impl FeatureEngine {
         f.put("cl_spot_ret_10s_bps", ret(&self.cl_spot.px_1s, 10));
         f.put("cl_twap_ret_10s_bps", ret(&self.cl_twap.px_1s, 10));
         f.put("cl_spot_ret_30s_bps", ret(&self.cl_spot.px_1s, 30));
+
+        // ---- settlement TWAP model (v2): distribution of the end-of-window 60 s TWAP
+        let (end_mean, end_sd, observed) = self.twap_end_distribution(m.end_us);
+        f.put("twap_end_mean", end_mean);
+        f.put("twap_end_sd", end_sd);
+        f.put("twap_window_observed", observed);
+        let p_twap = settle_probability(ptb, end_mean, end_sd);
+        f.put("p_twap_settle", p_twap);
+        f.put("logit_p_twap", logit(p_twap));
 
         // ---- polymarket
         let tok = |t: &str| self.poly.get(t);
@@ -1128,6 +1210,28 @@ mod tests {
         let mut e = FeatureEngine::new(syms(), "t".into());
         e.set_markets([market()]);
         records.iter().flat_map(|r| e.push(r.clone())).collect()
+    }
+
+    #[test]
+    fn twap_end_maths() {
+        // Far from the end: mean is spot, variance sigma^2 (t - 40).
+        let (m, sd) = twap_end_gaussian(100.0, f64::NAN, 300.0, 0.5);
+        assert_eq!(m, 100.0);
+        assert!((sd - 0.5 * 260f64.sqrt()).abs() < 1e-12);
+        // Exactly 60 s left: continuous at the boundary (60 - 40 = 20 = 60 / 3).
+        let (_, sd_hi) = twap_end_gaussian(100.0, 100.0, 60.0, 0.5);
+        let (_, sd_lo) = twap_end_gaussian(100.0, 100.0, 59.999_999, 0.5);
+        assert!((sd_hi - sd_lo).abs() < 1e-6);
+        // 15 s left with 45 s observed at 101: mean (45*101 + 15*100)/60, sd (15/60) * 0.5 * sqrt(5).
+        let (m, sd) = twap_end_gaussian(100.0, 101.0, 15.0, 0.5);
+        assert!((m - 100.75).abs() < 1e-12);
+        assert!((sd - 0.25 * 0.5 * 5f64.sqrt()).abs() < 1e-12);
+        // At the end the TWAP is fully observed.
+        assert_eq!(twap_end_gaussian(100.0, 101.0, 0.0, 0.5), (101.0, 0.0));
+        assert_eq!(settle_probability(100.0, 101.0, 0.0), 1.0);
+        assert!((settle_probability(100.0, 100.0, 1.0) - 0.5).abs() < 1e-7);
+        assert!(settle_probability(f64::NAN, 100.0, 1.0).is_nan());
+        assert!((logit(0.5)).abs() < 1e-12 && logit(1.0).is_finite());
     }
 
     #[test]

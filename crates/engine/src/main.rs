@@ -151,6 +151,39 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
             };
             let started = std::time::Instant::now();
             let rows = polygemy_engine::replay::replay_features(&pool, symbols, from, to).await?;
+            if let Some(path) = std::env::args().nth(4) {
+                // Research export of selected replayed features (e.g. to evaluate a new feature version).
+                let names = features::FeatureEngine::names();
+                let cols = [
+                    "time_remaining_s",
+                    "implied_p_up",
+                    "p_analytic",
+                    "p_twap_settle",
+                    "twap_window_observed",
+                    "price_to_beat",
+                    "twap_end_mean",
+                    "twap_end_sd",
+                ];
+                let idx: Vec<usize> = cols
+                    .iter()
+                    .map(|c| names.iter().position(|n| n == c).expect("feature"))
+                    .collect();
+                let mut out = format!("ts_us,condition_id,degraded,{}\n", cols.join(","));
+                for r in &rows {
+                    out.push_str(&format!(
+                        "{},{},{},{}\n",
+                        r.ts_us,
+                        r.condition_id,
+                        r.degraded,
+                        idx.iter()
+                            .map(|i| r.features[*i].to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+                std::fs::write(&path, out)?;
+                println!("wrote {} rows to {path}", rows.len());
+            }
             let c = polygemy_engine::replay::compare_with_stored(&pool, &rows, from, to).await?;
             info!(elapsed_s = started.elapsed().as_secs_f64(), comparison = ?c, "replay finished");
             println!("{c:#?}");

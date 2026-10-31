@@ -146,3 +146,12 @@ def test_baseline_matches_normal_cdf_and_registers(conn):
         assert abs(1 / (1 + np.exp(-k * z)) - phi) < 0.01
     v = registry.register(conn, art, {"note": "test"}, None)
     assert v.startswith("settlement-logistic-fv1-")
+
+
+def test_twap_baseline_passes_probability_through():
+    art = models.baseline_artifact(2, "twap")
+    assert art["features"] == ["logit_p_twap"] and art["feature_version"] == 2
+    lg = art["logistic"]
+    for p in [0.05, 0.3, 0.5, 0.8, 0.99]:
+        x = np.log(p / (1 - p))
+        assert abs(1 / (1 + np.exp(-(lg["coef"][0] * x + lg["intercept"]))) - p) < 1e-12

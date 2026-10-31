@@ -6,7 +6,7 @@
   python -m polygemy.research rollback HORIZON
   python -m polygemy.research retire   HORIZON
   python -m polygemy.research list
-  python -m polygemy.research baseline [--approve]   # analytic settlement baseline (not trained)
+  python -m polygemy.research baseline [--kind twap|spot] [--approve]   # analytic settlement baseline (not trained)
   python -m polygemy.research metrics  RUN_ID [--mode backtest]
   python -m polygemy.research walkforward --data data/ds1 --engine ../target/release/polygemy-engine [--groups combined,technical,...]
   python -m polygemy.research sync     --source URL --from 2026-11-01 --to 2026-11-08   (into DATABASE_URL)
@@ -39,7 +39,7 @@ def main(argv=None) -> int:
     e.add_argument("--to", dest="end", type=ts, required=True)
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--stride", type=int, default=1)
-    e.add_argument("--feature-version", type=int, default=1)
+    e.add_argument("--feature-version", type=int, default=2)
     t = sub.add_parser("train")
     t.add_argument("--data", type=Path, required=True)
     t.add_argument("--horizon", choices=["10s", "30s", "60s", "settlement"], required=True)
@@ -52,7 +52,8 @@ def main(argv=None) -> int:
     sub.add_parser("list")
     bl = sub.add_parser("baseline")
     bl.add_argument("--approve", action="store_true")
-    bl.add_argument("--feature-version", type=int, default=1)
+    bl.add_argument("--feature-version", type=int, default=2)
+    bl.add_argument("--kind", choices=["spot", "twap"], default="twap")
     mt = sub.add_parser("metrics")
     mt.add_argument("target")
     mt.add_argument("--mode", default="backtest")
@@ -112,8 +113,8 @@ def main(argv=None) -> int:
             with psycopg.connect(a.source) as src:
                 print(json.dumps(backtest.sync(src, conn, a.start, a.end), indent=2))
         elif a.cmd == "baseline":
-            art = models.baseline_artifact(a.feature_version)
-            v = registry.register(conn, art, {"note": "analytic baseline Phi(z_spot); not trained, no out-of-sample evidence"}, None)
+            art = models.baseline_artifact(a.feature_version, a.kind)
+            v = registry.register(conn, art, {"note": f"analytic baseline ({a.kind}); not trained, no out-of-sample evidence"}, None)
             print(f"registered {v}")
             if a.approve:
                 registry.promote(conn, v)

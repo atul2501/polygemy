@@ -88,12 +88,32 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
   - Inside warm-up, records re-sent on reconnect (deduplicated with their first arrival time) cause larger differences on rows that are already degraded.
 - **Process lesson:** a scripted text substitution silently failed, so a committed fix (Chainlink precision) was not actually in the code. Found by the real-data replay check and fixed with a regression test. Every substitution now asserts its anchor.
 
-## Provisional model (31 Oct 2026, 10:04 UTC)
+## Provisional model (31 Oct 2026, 10:04 UTC; replaced 15:20 UTC, see below)
 
-- **Approved:** `settlement-logistic-fv1-a8130ba6ce`, the **analytic baseline**: P(Up) = Φ(z_spot), approximated as sigmoid(1.702·z). It is not trained, has no out-of-sample evidence, and does not meet docs/VALIDATION.md. It exists so the prediction → strategy → paper path runs on real data and builds a calibration record.
+- **Was approved:** `settlement-logistic-fv1-a8130ba6ce`, the **analytic baseline**: P(Up) = Φ(z_spot), approximated as sigmoid(1.702·z). It is not trained, has no out-of-sample evidence, and does not meet docs/VALIDATION.md. It exists so the prediction → strategy → paper path runs on real data and builds a calibration record.
 - **Known weakness:** it is overconfident when recent volatility is very low (z becomes extreme and p saturates near 0 or 1). Watch the settlement calibration in the dashboard.
 - **Short horizons (10/30/60 s):** no model. A driftless baseline would only output 0.5.
 - **Replacing it:** `python -m polygemy.research promote <version>` (or `retire settlement` to stop predictions).
+
+## Settlement TWAP model, feature version 2 (31 Oct 2026, 15:20 UTC)
+
+- **What:** new features model the end-of-window Chainlink TWAP60 as a Gaussian: the reports already inside the final 60 s, plus the variance of the unobserved remainder of the average (`twap_end_mean/sd`, `twap_window_observed`, `p_twap_settle`, `logit_p_twap`). `FEATURE_VERSION` = 2; v1 models no longer load.
+- **Now approved:** `settlement-logistic-fv2-2cdd1a2f70` = `p_twap_settle` passed through (`polygemy.research baseline --kind twap`). Not trained; it does not meet docs/VALIDATION.md. Paper trading stays paused (`PAPER_TRADING_ENABLED=false`); predictions continue as a benchmark.
+- **Evaluation:** replay of 09:51–15:00 UTC, 62 settled markets, 14,755 non-degraded rows where the market had a quote. Brier score (lower is better):
+
+  | Time left | Rows | Markets | TWAP model | Old baseline (v1) | Market |
+  |---|---|---|---|---|---|
+  | 0–30 s | 114 | 13 | 0.182 | 0.201 | 0.109 |
+  | 30–60 s | 580 | 37 | 0.155 | 0.191 | 0.086 |
+  | 1–2 min | 3,121 | 61 | 0.128 | 0.142 | 0.097 |
+  | 2–3 min | 3,712 | 62 | 0.158 | 0.163 | 0.140 |
+  | 3–4 min | 3,709 | 62 | 0.206 | 0.209 | 0.188 |
+  | 4–5 min | 3,519 | 61 | 0.230 | 0.231 | 0.221 |
+
+  - Model minus market, bootstrapped by market (95 %): all rows +0.022 [+0.002, +0.039]; last 2 minutes +0.039 [+0.012, +0.060]. **The market is significantly better.**
+  - The settlement maths is right: at 1 s before the end the model's side matches the official outcome in 61 of 62 markets.
+  - The model is not overconfident: widening its sd makes Brier worse in every bucket. The market simply has information the model lacks, most likely faster exchange prices (Chainlink arrives ~1.2 s late).
+- **Decision (per the plan's rule):** not eligible for paper trading. Next candidates: nowcasting Chainlink from Binance/Coinbase, and a model trained with the market price as an input, both judged against the market.
 
 ## Data collection
 

@@ -109,10 +109,21 @@ def hmm_regimes(df: pd.DataFrame, n_states: int = 4) -> np.ndarray:
 PROBIT_TO_LOGIT = 1.702
 
 
-def baseline_artifact(feature_version: int) -> dict:
-    """Analytic settlement baseline, not trained: P(Up) = Phi(z_spot), where z_spot is the engine's
-    distance of the Chainlink price from the price to beat in units of volatility x sqrt(time left).
-    Missing z (no price to beat yet) gives 0.5."""
+def baseline_artifact(feature_version: int, kind: str = "spot") -> dict:
+    """Analytic settlement baseline, not trained. kind "spot": P(Up) = Phi(z_spot), where z_spot is the
+    engine's distance of the Chainlink price from the price to beat in units of volatility x sqrt(time
+    left). kind "twap" (feature version >= 2): P(Up) = p_twap_settle, the engine's Gaussian model of the
+    end-of-window TWAP60, passed through as sigmoid(logit_p_twap). A missing input gives 0.5."""
+    if kind == "twap":
+        return {
+            "format": 1,
+            "kind": "logistic",
+            "horizon": "settlement",
+            "feature_version": feature_version,
+            "features": ["logit_p_twap"],
+            "logistic": {"coef": [1.0], "intercept": 0.0, "impute": [0.0], "mean": [0.0], "scale": [1.0]},
+            "calibration": None,
+        }
     return {
         "format": 1,
         "kind": "logistic",

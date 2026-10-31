@@ -17,6 +17,8 @@ import psycopg
 
 from . import dataset, models
 
+FEATURE_VERSION = 2  # must match the engine's FEATURE_VERSION
+
 
 def build(names: list[str]) -> dict:
     rng = np.random.default_rng(11)
@@ -30,7 +32,7 @@ def build(names: list[str]) -> dict:
     for kind in ("lightgbm", "logistic"):
         m = models.fit(kind, X.iloc[:3000], y[:3000])
         table = models.isotonic_table(models.predict_raw(m, X.iloc[3000:]), y[3000:])
-        art = models.artifact(kind, "settlement", 1, use, m, table)
+        art = models.artifact(kind, "settlement", FEATURE_VERSION, use, m, table)
         full = np.full((60, len(names)), np.nan)
         probe = pd.DataFrame(rng.normal(size=(60, len(use))), columns=use)
         probe.loc[::7, "rsi14"] = np.nan
@@ -45,7 +47,7 @@ def build(names: list[str]) -> dict:
 
 if __name__ == "__main__":
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
-        names = dataset.feature_names(conn, 1)
+        names = dataset.feature_names(conn, FEATURE_VERSION)
     with open(sys.argv[1], "w") as f:
         json.dump(build(names), f)
     print(f"wrote {sys.argv[1]}")

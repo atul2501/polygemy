@@ -79,6 +79,7 @@ def build(conn: Connection, start: datetime, end: datetime, version: int, stride
     )
     for h, s in HORIZONS.items():
         df[f"y_{h}"] = short_horizon_labels(df["ts"], rep, s)
+    df.attrs["feature_version"] = version
     return df
 
 
