@@ -88,6 +88,13 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
   - Inside warm-up, records re-sent on reconnect (deduplicated with their first arrival time) cause larger differences on rows that are already degraded.
 - **Process lesson:** a scripted text substitution silently failed, so a committed fix (Chainlink precision) was not actually in the code. Found by the real-data replay check and fixed with a regression test. Every substitution now asserts its anchor.
 
+## Provisional model (31 Oct 2026, 10:04 UTC)
+
+- **Approved:** `settlement-logistic-fv1-a8130ba6ce`, the **analytic baseline**: P(Up) = Φ(z_spot), approximated as sigmoid(1.702·z). It is not trained, has no out-of-sample evidence, and does not meet docs/VALIDATION.md. It exists so the prediction → strategy → paper path runs on real data and builds a calibration record.
+- **Known weakness:** it is overconfident when recent volatility is very low (z becomes extreme and p saturates near 0 or 1). Watch the settlement calibration in the dashboard.
+- **Short horizons (10/30/60 s):** no model. A driftless baseline would only output 0.5.
+- **Replacing it:** `python -m polygemy.research promote <version>` (or `retire settlement` to stop predictions).
+
 ## Data collection
 
 Continuous paper-mode collection on the local PC started 31 Oct 2026 ~07:40 UTC (`make up`). Only runs while the PC is on; Polymarket hosts reset intermittently on this network.

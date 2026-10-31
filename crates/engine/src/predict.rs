@@ -406,6 +406,22 @@ mod tests {
         assert!((se - (0.4 * 0.6 / 400.0f64).sqrt()).abs() < 1e-12);
     }
 
+    /// The analytic baseline artifact (python -m polygemy.research baseline) evaluates to Phi(z_spot).
+    #[test]
+    fn analytic_baseline_tracks_normal_cdf() {
+        let art = json!({"format": 1, "kind": "logistic", "horizon": "settlement", "feature_version": FEATURE_VERSION, "features": ["z_spot"],
+            "logistic": {"coef": [1.702], "intercept": 0.0, "impute": [0.0], "mean": [0.0], "scale": [1.0]}, "calibration": null});
+        let m = Model::from_artifact("baseline", &art).unwrap();
+        let names = names();
+        let zi = names.iter().position(|n| *n == "z_spot").unwrap();
+        let mut x = vec![f64::NAN; names.len()];
+        assert_eq!(m.predict(&x).0, 0.5, "no price to beat yet: no opinion");
+        for z in [-3.0, -1.0, 0.0, 0.7, 2.5] {
+            x[zi] = z;
+            assert!((m.predict(&x).0 - crate::features::indicators::norm_cdf(z)).abs() < 0.01, "z {z}");
+        }
+    }
+
     #[test]
     fn rejects_mismatched_artifacts() {
         let names = names();

@@ -134,3 +134,15 @@ def test_registry_promote_and_rollback(conn):
     assert registry.rollback(conn, horizon) == versions[0]
     registry.retire(conn, horizon)
     assert conn.execute("SELECT count(*) FROM model_versions WHERE horizon = %s AND status = 'approved'", (horizon,)).fetchone()[0] == 0
+
+
+def test_baseline_matches_normal_cdf_and_registers(conn):
+    from math import erf, sqrt
+
+    art = models.baseline_artifact(1)
+    k = art["logistic"]["coef"][0]
+    for z in [-3, -1.5, -0.5, 0, 0.5, 1.5, 3]:
+        phi = 0.5 * (1 + erf(z / sqrt(2)))
+        assert abs(1 / (1 + np.exp(-k * z)) - phi) < 0.01
+    v = registry.register(conn, art, {"note": "test"}, None)
+    assert v.startswith("settlement-logistic-fv1-")

@@ -103,3 +103,22 @@ def hmm_regimes(df: pd.DataFrame, n_states: int = 4) -> np.ndarray:
         trend = "up_trend" if ret_m > 0.5 else "down_trend" if ret_m < -0.5 else "range"
         names[s] = f"{vol}/{trend}"
     return np.array([names[s] for s in states], dtype=object)
+
+
+# Logistic approximation of the normal CDF: Phi(z) ~= sigmoid(1.702 z), |error| < 0.01.
+PROBIT_TO_LOGIT = 1.702
+
+
+def baseline_artifact(feature_version: int) -> dict:
+    """Analytic settlement baseline, not trained: P(Up) = Phi(z_spot), where z_spot is the engine's
+    distance of the Chainlink price from the price to beat in units of volatility x sqrt(time left).
+    Missing z (no price to beat yet) gives 0.5."""
+    return {
+        "format": 1,
+        "kind": "logistic",
+        "horizon": "settlement",
+        "feature_version": feature_version,
+        "features": ["z_spot"],
+        "logistic": {"coef": [PROBIT_TO_LOGIT], "intercept": 0.0, "impute": [0.0], "mean": [0.0], "scale": [1.0]},
+        "calibration": None,
+    }

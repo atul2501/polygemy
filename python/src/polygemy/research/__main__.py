@@ -6,6 +6,7 @@
   python -m polygemy.research rollback HORIZON
   python -m polygemy.research retire   HORIZON
   python -m polygemy.research list
+  python -m polygemy.research baseline [--approve]   # analytic settlement baseline (not trained)
   python -m polygemy.research metrics  RUN_ID [--mode backtest]
   python -m polygemy.research walkforward --data data/ds1 --engine ../target/release/polygemy-engine [--groups combined,technical,...]
   python -m polygemy.research sync     --source URL --from 2026-11-01 --to 2026-11-08   (into DATABASE_URL)
@@ -49,6 +50,9 @@ def main(argv=None) -> int:
     for name in ("promote", "rollback", "retire"):
         sub.add_parser(name).add_argument("target")
     sub.add_parser("list")
+    bl = sub.add_parser("baseline")
+    bl.add_argument("--approve", action="store_true")
+    bl.add_argument("--feature-version", type=int, default=1)
     mt = sub.add_parser("metrics")
     mt.add_argument("target")
     mt.add_argument("--mode", default="backtest")
@@ -107,6 +111,13 @@ def main(argv=None) -> int:
         elif a.cmd == "sync":
             with psycopg.connect(a.source) as src:
                 print(json.dumps(backtest.sync(src, conn, a.start, a.end), indent=2))
+        elif a.cmd == "baseline":
+            art = models.baseline_artifact(a.feature_version)
+            v = registry.register(conn, art, {"note": "analytic baseline Phi(z_spot); not trained, no out-of-sample evidence"}, None)
+            print(f"registered {v}")
+            if a.approve:
+                registry.promote(conn, v)
+                print(f"approved {v} (replaces any approved settlement model; the engine reloads within 60 s)")
         elif a.cmd == "list":
             for r in conn.execute("SELECT version, status, created_at, approved_at, metrics->>'brier', metrics->>'n' FROM model_versions ORDER BY horizon, created_at"):
                 print(*r)
