@@ -15,13 +15,32 @@ Locally you develop, test collectors, capture history, and simulate lifecycles. 
 
 ## Polymarket API credentials (needed for Chainlink)
 
-Chainlink BTC/USD (spot and 60 s TWAP) is streamed by Polymarket's PolyBolt service. It requires CLOB API credentials: key, secret and passphrase. The engine uses them only to read prices.
+Chainlink BTC/USD (spot and 60 s TWAP) is streamed by Polymarket's PolyBolt service and requires CLOB API credentials: key, secret and passphrase. They are **not shown on polymarket.com**. Settings → API Keys gives *Relayer* keys and Settings → Builders gives *Builder* keys; neither works here. CLOB credentials are derived by signing Polymarket's `ClobAuth` message with a wallet key.
 
-1. Derive the credentials once from your Polymarket wallet. Use the official client's "create or derive API key" call (see <https://docs.polymarket.com/getting-started/api.md#authentication>). Do this on your PC; the wallet private key never goes to the server.
-2. Put the three values in `.env.stockholm` (and in `.env.local` if you want Chainlink locally) as `POLY_API_KEY`, `POLY_API_SECRET` and `POLY_API_PASSPHRASE`. Then run `chmod 600` on the file.
-3. Without them, the `chainlink_*` feeds show `DISCONNECTED` with "no Polymarket CLOB API credentials configured", and no market can become READY.
+```sh
+uv run scripts/derive_clob_credentials.py --env-file .env.local       # PC
+uv run scripts/derive_clob_credentials.py --env-file .env.stockholm   # then copy that file to the VPS
+```
+
+- **A fresh data-only wallet.** By default the script generates a new, unfunded wallet used only for reading data. It signs the auth message, creates or derives the credentials, and writes `POLY_API_KEY`, `POLY_API_SECRET` and `POLY_API_PASSPHRASE` into the file (`chmod 600`).
+- **Nothing secret is printed or stored.** The private key is never printed or written. Because the wallet holds no funds, losing it costs nothing: run the script again for new credentials.
+- **Your real account key never touches these machines for market data.** Trading (Phase 5) uses a separate, explicitly configured signer.
+- **Verified 31 Oct 2026:** the CLOB issued credentials for a brand-new address, and PolyBolt then streamed both Chainlink feeds (1 report/s each).
+- **Using an existing key:** set `POLYMARKET_SIGNER_KEY=0x… uv run scripts/derive_clob_credentials.py --print`.
+
+Without credentials, the `chainlink_*` feeds show `DISCONNECTED` with "no Polymarket CLOB API credentials configured", and no market can become READY.
 
 Before using any account, confirm that you as the operator, and the account, are eligible under Polymarket's current terms. The server's location doesn't decide that.
+
+## Storage (small-storage mode)
+
+| Setting | Default | Effect |
+|---|---|---|
+| `RAW_RETENTION_HOURS` | 24 | Raw `exchange_events` and `orderbook_snapshots` are kept in hourly partitions and dropped after this many hours. |
+| `STORE_BOOK_DELTAS` | false | Per-level book changes stay in memory for the live books but aren't written. `true` costs about 50 GB/day. |
+| `DB_SIZE_BUDGET_GB` | 20 | Above 80% of this, the oldest raw partitions are dropped early. The last 2 hours are never dropped. |
+
+What is stored in this mode: trades, best bid/ask when a price changes, Polymarket server `book` messages, 1-second top-20 book snapshots, and every Chainlink report. **Measured 31 Oct 2026: 2.8 GB/day of raw growth** (vs ~50 GB/day with deltas), so about 3 GB at steady state with 24 h retention. Long-lived history lives in the compact tables (markets, lifecycles, Chainlink reports, and from Phase 3 features and predictions). `make status` shows the database size against the budget.
 
 ## Stockholm VPS
 
@@ -71,7 +90,8 @@ SELECT details FROM system_events WHERE kind = 'settlement_reconciliation' ORDER
 | `configuration error: …` and exit code 2 | Invalid or inconsistent env | Fix the variable named in the message. |
 | `database is missing migrations` | Migrations not applied | `make migrate` (locally) or `make up` (Docker runs `migrate` first). |
 | `database has migrations … this build does not know` | Running an older build on a newer schema | Deploy the matching release. Don't downgrade the schema. |
-| `chainlink_*` DISCONNECTED, "no … credentials" | `POLY_API_*` not set | See the credentials section above. |
+| `chainlink_*` DISCONNECTED, "no … credentials" | `POLY_API_*` not set | Run `scripts/derive_clob_credentials.py` (see above). |
+| `database above 80% of DB_SIZE_BUDGET_GB` warning | Long-lived tables have outgrown the budget | Raise `DB_SIZE_BUDGET_GB`, or lower `RAW_RETENTION_HOURS`. |
 | PolyBolt closes with 4001 or 4008, reconnect waits 60 s | Bad credentials or a policy violation | Fix the credentials. The engine backs off deliberately. |
 | `polymarket` / `discovery` RECOVERING, "connection reset" | Network path blocks Polymarket hosts | Check from the VPS with `curl -sI https://gamma-api.polymarket.com/status`. Don't use a VPN to get around it. |
 | Feed DEGRADED, `sequence_gaps` rising | Lost messages, or the host is too slow | Check `process_latency_p99`, CPU and network. The book resyncs automatically. |

@@ -42,7 +42,7 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
         "migrate" => {
             let pool = db::connect(&cfg.database_url, 1).await?;
             db::migrate(&pool).await?;
-            persist::ensure_partitions(&pool, 2).await?;
+            persist::ensure_partitions(&pool).await?;
             info!(version = build_version(), "migrations applied");
             Ok(())
         }
@@ -67,7 +67,7 @@ async fn run(cfg: &Config) -> Result<()> {
     let instance_id = format!("{app_env}-{}", uuid::Uuid::new_v4());
     let pool = db::connect(&cfg.database_url, cfg.db_max_connections).await?;
     db::ensure_schema_current(&pool).await?;
-    persist::ensure_partitions(&pool, 2).await?;
+    persist::ensure_partitions(&pool).await?;
 
     let event = |kind, message, details| Event {
         instance_id: &instance_id,
@@ -112,10 +112,7 @@ async fn run(cfg: &Config) -> Result<()> {
         if f.on("binance") {
             let h = health("binance");
             let s = Binance::new(
-                Ctx {
-                    sink: sink.clone(),
-                    health: h.clone(),
-                },
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
                 f.binance_ws_url.clone(),
                 f.binance_rest_url.clone(),
                 f.binance_symbol.clone(),
@@ -127,10 +124,7 @@ async fn run(cfg: &Config) -> Result<()> {
         if f.on("coinbase") {
             let h = health("coinbase");
             let s = Coinbase::new(
-                Ctx {
-                    sink: sink.clone(),
-                    health: h.clone(),
-                },
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
                 f.coinbase_ws_url.clone(),
                 f.coinbase_product.clone(),
             );
@@ -140,10 +134,7 @@ async fn run(cfg: &Config) -> Result<()> {
         if f.on("deribit") {
             let h = health("deribit");
             let s = Deribit::new(
-                Ctx {
-                    sink: sink.clone(),
-                    health: h.clone(),
-                },
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
                 f.deribit_ws_url.clone(),
                 f.deribit_instrument.clone(),
                 f.deribit_extra_tickers.clone(),
@@ -165,10 +156,7 @@ async fn run(cfg: &Config) -> Result<()> {
                             passphrase: pass.clone(),
                         };
                         let s = Chainlink::new(
-                            Ctx {
-                                sink: sink.clone(),
-                                health: h.clone(),
-                            },
+                            Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
                             f.polybolt_ws_url.clone(),
                             creds,
                             stream,
@@ -195,10 +183,7 @@ async fn run(cfg: &Config) -> Result<()> {
                 stale.max(Duration::from_secs(15)),
             ));
             let s = Polymarket::new(
-                Ctx {
-                    sink: sink.clone(),
-                    health: h.clone(),
-                },
+                Ctx::new(sink.clone(), h.clone(), f.store_book_deltas),
                 f.polymarket_ws_url.clone(),
                 poly_state.clone(),
             );
@@ -262,6 +247,10 @@ async fn run(cfg: &Config) -> Result<()> {
         http: http.clone(),
         time_reference_url: f.binance_rest_url.clone(),
         flush_every: Duration::from_secs(60),
+        retention: persist::Retention {
+            keep_hours: f.raw_retention_hours,
+            budget_bytes: f.db_size_budget_gb as i64 * 1_073_741_824,
+        },
     };
     tasks.push(tokio::spawn(monitor.run(stop_rx.clone())));
     drop(sink);
@@ -301,6 +290,14 @@ async fn status(cfg: &Config) -> Result<()> {
     )
     .fetch_all(&pool)
     .await?;
+    let db_bytes = persist::db_size(&pool).await?;
+    println!(
+        "database {} MB of {} GB budget (raw retention {} h, book deltas stored: {})\n",
+        db_bytes / 1_048_576,
+        cfg.feeds.db_size_budget_gb,
+        cfg.feeds.raw_retention_hours,
+        cfg.feeds.store_book_deltas
+    );
     println!(
         "{:<18} {:<13} {:<4} {:>9} {:>6} {:>6} {:>6} {:>8}  last error",
         "FEED", "STATUS", "REQ", "AGE(s)", "RECON", "GAPS", "ERR", "DROPPED"

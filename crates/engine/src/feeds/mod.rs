@@ -7,26 +7,57 @@ pub mod coinbase;
 pub mod deribit;
 pub mod polymarket;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use rust_decimal::Decimal;
 
 use serde_json::Value;
 
 use crate::book::OrderBook;
 use crate::clock::Received;
-use crate::event::MarketEvent;
+use crate::event::{Kind, MarketEvent};
 use crate::health::FeedHealth;
 use crate::persist::{BookSnapshot, Record, Sink};
 
 /// Levels per side kept in periodic book snapshots.
 pub const SNAPSHOT_LEVELS: usize = 20;
 
+/// (best bid, best ask)
+type TopOfBook = (Option<Decimal>, Option<Decimal>);
+
 #[derive(Clone)]
 pub struct Ctx {
     pub sink: Sink,
     pub health: Arc<FeedHealth>,
+    /// Persist per-level book deltas (STORE_BOOK_DELTAS). Books in memory are unaffected.
+    pub store_book_deltas: bool,
+    /// Last stored best bid/ask per symbol: a BBO is only persisted when a price changes.
+    last_bbo: Arc<Mutex<HashMap<String, TopOfBook>>>,
 }
 
 impl Ctx {
+    pub fn new(sink: Sink, health: Arc<FeedHealth>, store_book_deltas: bool) -> Self {
+        Ctx {
+            sink,
+            health,
+            store_book_deltas,
+            last_bbo: Arc::default(),
+        }
+    }
+
+    /// Small-storage filter: drop book deltas unless enabled, and BBOs whose prices did not change.
+    fn should_store(&self, e: &MarketEvent) -> bool {
+        match e.kind {
+            Kind::BookDelta => self.store_book_deltas,
+            Kind::Bbo => {
+                let mut last = self.last_bbo.lock().unwrap_or_else(|p| p.into_inner());
+                last.insert(e.symbol.clone(), (e.bid, e.ask)) != Some((e.bid, e.ask))
+            }
+            _ => true,
+        }
+    }
+
     /// Stamp the processing time (monotonic, relative to receipt), update health, enqueue.
     pub fn emit(&self, e: MarketEvent, rx: Received) {
         let exch = e.exchange_ts_us;
@@ -43,7 +74,9 @@ impl Ctx {
         let valid = e.quality == crate::event::Quality::Valid;
         self.health
             .on_message(e.received_us, latency_ts, e.processed_us, valid);
-        self.sink.send(Record::Event(e), &self.health);
+        if self.should_store(&e) {
+            self.sink.send(Record::Event(e), &self.health);
+        }
     }
 
     pub fn snapshot(

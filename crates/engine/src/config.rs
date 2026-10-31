@@ -80,6 +80,12 @@ pub struct Feeds {
     pub discovery_interval_secs: u64,
     pub discovery_lookahead_secs: u64,
     pub persist_queue_capacity: usize,
+    /// Raw events / book snapshots older than this are dropped (hourly partitions).
+    pub raw_retention_hours: i64,
+    /// Persist every per-level book change (large). Live books are kept in memory either way.
+    pub store_book_deltas: bool,
+    /// Database size budget; above 80 % the oldest raw partitions are dropped early.
+    pub db_size_budget_gb: u64,
 }
 
 // Hand-written so the API credentials can never reach a log line.
@@ -189,6 +195,13 @@ impl Feeds {
             discovery_interval_secs: num("DISCOVERY_INTERVAL_SECS", "15")?.max(1),
             discovery_lookahead_secs: num("DISCOVERY_LOOKAHEAD_SECS", "600")?,
             persist_queue_capacity: num("PERSIST_QUEUE_CAPACITY", "100000")?.max(1000) as usize,
+            raw_retention_hours: num("RAW_RETENTION_HOURS", "24")?.max(1) as i64,
+            store_book_deltas: pick(
+                "STORE_BOOK_DELTAS",
+                &or("STORE_BOOK_DELTAS", "false"),
+                &[("true", true), ("false", false)],
+            )?,
+            db_size_budget_gb: num("DB_SIZE_BUDGET_GB", "20")?.max(1),
         })
     }
 }
@@ -309,6 +322,9 @@ impl Config {
             "required_feeds": self.feeds.required,
             "polymarket_api_credentials": self.feeds.poly_api.is_some(),
             "series_slug": self.feeds.series_slug,
+            "raw_retention_hours": self.feeds.raw_retention_hours,
+            "store_book_deltas": self.feeds.store_book_deltas,
+            "db_size_budget_gb": self.feeds.db_size_budget_gb,
         })
     }
 }

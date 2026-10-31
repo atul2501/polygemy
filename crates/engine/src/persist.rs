@@ -94,16 +94,86 @@ pub fn channel(capacity: usize) -> (Sink, mpsc::Receiver<Record>) {
 const BATCH_ROWS: usize = 2000;
 const BATCH_WAIT: Duration = Duration::from_millis(200);
 pub const PARTITIONED_TABLES: [&str; 2] = ["exchange_events", "orderbook_snapshots"];
+/// Hourly partitions are created this far ahead (and one hour back).
+const PARTITION_HOURS_AHEAD: i32 = 12;
+/// Size-budget pruning never drops raw data younger than this.
+const MIN_KEEP_HOURS: i64 = 2;
 
-/// Creates daily partitions from yesterday through `days_ahead` days from now (idempotent).
-pub async fn ensure_partitions(pool: &PgPool, days_ahead: i32) -> Result<()> {
+/// Creates hourly partitions from the previous hour to `PARTITION_HOURS_AHEAD` ahead (idempotent).
+pub async fn ensure_partitions(pool: &PgPool) -> Result<()> {
     for table in PARTITIONED_TABLES {
-        sqlx::query("SELECT ensure_daily_partitions($1, (now() AT TIME ZONE 'UTC')::date - 1, $2)")
+        sqlx::query("SELECT ensure_hourly_partitions($1, now() - interval '1 hour', $2)")
             .bind(table)
-            .bind(days_ahead + 2)
+            .bind(PARTITION_HOURS_AHEAD + 2)
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    /// Raw partitions whose range ended more than this many hours ago are dropped.
+    pub keep_hours: i64,
+    /// Database size budget; above 80 % of it the oldest raw partitions go early.
+    pub budget_bytes: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct RetentionReport {
+    pub dropped: Vec<String>,
+    pub db_bytes: i64,
+    /// Still above 80 % of the budget after dropping everything allowed.
+    pub over_budget: bool,
+}
+
+/// Drops raw partitions past retention, then prunes oldest-first while over 80 % of the budget.
+pub async fn enforce_retention(pool: &PgPool, r: Retention) -> Result<RetentionReport> {
+    let parts: Vec<(String, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as("SELECT partition, upper_bound FROM raw_partitions()")
+            .fetch_all(pool)
+            .await?;
+    let now = chrono::Utc::now();
+    let mut report = RetentionReport::default();
+    let mut remaining = Vec::new();
+    for (name, upper) in parts {
+        if upper < now - chrono::Duration::hours(r.keep_hours) {
+            drop_partition(pool, &name).await?;
+            report.dropped.push(name);
+        } else {
+            remaining.push((name, upper));
+        }
+    }
+    report.db_bytes = db_size(pool).await?;
+    let limit = r.budget_bytes / 10 * 8;
+    for (name, upper) in remaining {
+        if report.db_bytes <= limit || upper >= now - chrono::Duration::hours(MIN_KEEP_HOURS) {
+            break;
+        }
+        drop_partition(pool, &name).await?;
+        report.dropped.push(name);
+        report.db_bytes = db_size(pool).await?;
+    }
+    report.over_budget = report.db_bytes > limit;
+    Ok(report)
+}
+
+pub async fn db_size(pool: &PgPool) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT pg_database_size(current_database())")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn drop_partition(pool: &PgPool, name: &str) -> Result<()> {
+    // `name` comes from the catalog via raw_partitions(); quote it anyway.
+    sqlx::query(&format!(
+        "DROP TABLE IF EXISTS \"{}\"",
+        name.replace('"', "")
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -161,7 +231,7 @@ async fn write_with_retry(pool: &PgPool, batch: &[Record], stats: &WriterStats) 
             // The server rejected the data (e.g. a missing partition or one malformed row).
             // Fix partitions and retry once; then isolate bad rows instead of blocking the pipeline.
             db_errors += 1;
-            if let Err(e) = ensure_partitions(pool, 2).await {
+            if let Err(e) = ensure_partitions(pool).await {
                 warn!(error = format!("{e:#}"), "partition maintenance failed");
             }
             if db_errors >= 2 {

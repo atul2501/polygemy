@@ -233,10 +233,11 @@ async fn lifecycle_end_to_end_with_restart() {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let (sink, _rx) = persist::channel(1000);
     let mut session = Polymarket::new(
-        Ctx {
+        Ctx::new(
             sink,
-            health: Arc::new(FeedHealth::new("polymarket", true, Duration::from_secs(5))),
-        },
+            Arc::new(FeedHealth::new("polymarket", true, Duration::from_secs(5))),
+            true,
+        ),
         "ws://unused".into(),
         state.clone(),
     );

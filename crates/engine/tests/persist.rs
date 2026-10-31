@@ -25,7 +25,7 @@ async fn pool(app: &str) -> PgPool {
         .await
         .unwrap();
     polygemy_engine::db::migrate(&pool).await.unwrap();
-    persist::ensure_partitions(&pool, 2).await.unwrap();
+    persist::ensure_partitions(&pool).await.unwrap();
     pool
 }
 
@@ -183,4 +183,39 @@ async fn chainlink_reports_and_snapshots_persist_and_dedupe() {
         .await
         .unwrap();
     assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn retention_drops_old_hourly_partitions_only() {
+    let pool = pool("persist-retention").await;
+    // Partitions for a past hour (Jan 2020) stand in for data older than the retention window.
+    sqlx::query("SELECT ensure_hourly_partitions('exchange_events', '2020-01-01 05:00+00', 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r = persist::enforce_retention(
+        &pool,
+        persist::Retention {
+            keep_hours: 24,
+            budget_bytes: i64::MAX / 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        r.dropped.iter().any(|p| p == "exchange_events_p2020010105"),
+        "{:?}",
+        r.dropped
+    );
+    assert!(
+        r.dropped
+            .iter()
+            .all(|p| !p.contains(&chrono::Utc::now().format("%Y%m%d%H").to_string())),
+        "current hour kept"
+    );
+    assert!(!r.over_budget);
+    // Writing now still works: the current hour's partition exists.
+    let sym = format!("R{}", uuid::Uuid::new_v4().simple());
+    write_all(&pool, vec![trade(&sym, "1", now_us(), "1")]).await;
+    assert_eq!(count(&pool, &sym).await, 1);
 }

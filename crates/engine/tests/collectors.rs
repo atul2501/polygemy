@@ -22,7 +22,7 @@ fn ctx(name: &'static str) -> (Ctx, mpsc::Receiver<Record>) {
     let (sink, rx) = persist::channel(10_000);
     let health = Arc::new(FeedHealth::new(name, true, Duration::from_secs(5)));
     health.on_connected();
-    (Ctx { sink, health }, rx)
+    (Ctx::new(sink, health, true), rx)
 }
 
 fn drain(rx: &mut mpsc::Receiver<Record>) -> Vec<Record> {
@@ -483,10 +483,7 @@ async fn chainlink_gap_drop_and_stale() {
 async fn full_queue_counts_drops_never_blocks() {
     let (sink, _rx) = persist::channel(1);
     let health = Arc::new(FeedHealth::new("x", false, Duration::from_secs(5)));
-    let c = Ctx {
-        sink,
-        health: health.clone(),
-    };
+    let c = Ctx::new(sink, health.clone(), true);
     let mut b = Binance::new(
         c,
         "ws://unused".into(),
@@ -580,4 +577,55 @@ async fn polymarket_levels_consumed_by_fills_are_repaired_in_place() {
     );
     assert!(h.books_ready(&[UP.to_string()]));
     assert_eq!(c.health.snapshot().gaps, 0, "not a data loss");
+}
+
+/// Small-storage mode: deltas stay out of the database, BBOs are stored only on price change,
+/// while health still counts every message.
+#[tokio::test]
+async fn small_storage_filters_deltas_and_unchanged_bbo() {
+    let (sink, mut rx) = persist::channel(1000);
+    let health = Arc::new(FeedHealth::new("binance", false, Duration::from_secs(5)));
+    let mut b = Binance::new(
+        Ctx::new(sink, health.clone(), false),
+        "ws://unused".into(),
+        "http://127.0.0.1:9".into(),
+        "BTCUSDT".into(),
+        reqwest::Client::new(),
+    );
+    let bbo = |u: i64, bid: &str, size: &str| {
+        json!({"stream": "btcusdt@bookTicker", "data": {"u": u, "s": "BTCUSDT", "b": bid, "B": size, "a": "101", "A": "1"}}).to_string()
+    };
+    feed(&mut b, &bbo(1, "100", "1")).unwrap();
+    feed(&mut b, &bbo(2, "100", "2")).unwrap(); // size-only change: not stored
+    feed(&mut b, &bbo(3, "100.5", "2")).unwrap();
+    for f in fixture("binance.jsonl")
+        .iter()
+        .filter(|f| f.contains("depthUpdate"))
+    {
+        feed(&mut b, f).unwrap();
+    }
+    let recs = drain(&mut rx);
+    let ev = events(&recs);
+    assert_eq!(ev.iter().filter(|e| e.kind == Kind::Bbo).count(), 2);
+    assert_eq!(ev.iter().filter(|e| e.kind == Kind::BookDelta).count(), 0);
+    assert_eq!(
+        health.take_interval().messages,
+        4,
+        "every message still counted for health"
+    );
+}
+
+/// Found in the fifth live run: the server's best bid "0" means the bid side is now empty.
+#[tokio::test]
+async fn polymarket_server_empty_side_clears_local_side() {
+    let (mut p, h, _cmds, c, _rx) = poly();
+    h.subscribe(CID, &[UP.to_string()]);
+    let book = json!({"event_type": "book", "market": CID, "asset_id": UP, "timestamp": "10",
+        "bids": [{"price": "0.01", "size": "100"}], "asks": [{"price": "0.02", "size": "5"}]});
+    feed(&mut p, &book.to_string()).unwrap();
+    let change = json!({"event_type": "price_change", "market": CID, "timestamp": "11", "price_changes": [
+        {"asset_id": UP, "price": "0.02", "size": "7", "side": "SELL", "best_bid": "0", "best_ask": "0.02"}]});
+    assert!(feed(&mut p, &change.to_string()).unwrap().is_empty());
+    assert_eq!(c.health.snapshot().gaps, 0);
+    assert!(h.books_ready(&[UP.to_string()]));
 }

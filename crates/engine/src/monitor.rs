@@ -28,6 +28,7 @@ pub struct Monitor {
     /// Binance REST base, used as the reference for the local clock-offset estimate.
     pub time_reference_url: String,
     pub flush_every: Duration,
+    pub retention: persist::Retention,
 }
 
 impl Monitor {
@@ -58,9 +59,23 @@ impl Monitor {
                 }
                 bucket_start = now_us();
             }
-            if ticks % 3600 == 0 {
-                if let Err(e) = persist::ensure_partitions(&self.pool, 2).await {
+            if ticks % 600 == 0 {
+                if let Err(e) = persist::ensure_partitions(&self.pool).await {
                     warn!(error = format!("{e:#}"), "partition maintenance failed");
+                }
+            }
+            if ticks % 60 == 0 {
+                match persist::enforce_retention(&self.pool, self.retention).await {
+                    Ok(r) => {
+                        if !r.dropped.is_empty() {
+                            info!(dropped = ?r.dropped, db_mb = r.db_bytes / 1_048_576, "raw partitions dropped by retention");
+                        }
+                        if r.over_budget {
+                            warn!(db_mb = r.db_bytes / 1_048_576, budget_mb = self.retention.budget_bytes / 1_048_576,
+                                "database above 80% of DB_SIZE_BUDGET_GB with nothing left to prune; raise the budget or lower retention");
+                        }
+                    }
+                    Err(e) => warn!(error = format!("{e:#}"), "retention failed"),
                 }
             }
         }

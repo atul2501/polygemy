@@ -136,4 +136,4 @@ Next-market preloading: discovery looks `DISCOVERY_LOOKAHEAD_SECS` ahead. Each m
 
 The suggested `trade_events` and `orderbook_updates` tables are not separate tables. They are the `trade` and `book_delta` kinds of `exchange_events`, which keeps one table, one partitioning scheme and one write path.
 
-The engine creates partitions from yesterday to two days ahead at startup and every hour. No retention or archiving is in place yet; that comes with the backup work in Phase 8.
+Raw tables use **hourly** partitions (migration 0003). The engine creates them 12 hours ahead and drops them after `RAW_RETENTION_HOURS`, and earlier still if the database passes 80% of `DB_SIZE_BUDGET_GB`. Per-level book deltas are not persisted by default (`STORE_BOOK_DELTAS=false`), and a best bid/ask is only stored when a price changes. Measured raw growth is 2.8 GB/day. See OPERATIONS.md.

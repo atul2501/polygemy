@@ -339,11 +339,12 @@ impl Polymarket {
         let Some(book) = self.books.get_mut(asset).filter(|b| b.synced) else {
             return;
         };
-        // Polymarket reports an empty side as best bid 0 / best ask 1.
-        if let Some(b) = bid.filter(|b| !b.is_zero()) {
+        // Polymarket reports an empty side as best bid 0 / best ask 1, which this rule handles
+        // as well: no bid above 0 (or ask below 1) can exist.
+        if let Some(b) = bid {
             book.remove_better_than(BookSide::Bid, b);
         }
-        if let Some(a) = ask.filter(|a| *a != Decimal::ONE) {
+        if let Some(a) = ask {
             book.remove_better_than(BookSide::Ask, a);
         }
         let ours_bid = book.best_bid().map(|l| l.0).unwrap_or(Decimal::ZERO);
