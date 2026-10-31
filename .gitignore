@@ -1,0 +1,11 @@
+/target/
+.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+# environment files hold secrets: only .env.example is committed
+.env
+.env.*
+!.env.example
+*.secrets
+/backups/

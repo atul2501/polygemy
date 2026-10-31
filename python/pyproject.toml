@@ -1,0 +1,19 @@
+[project]
+name = "polygemy"
+version = "0.1.0"
+description = "Research, model training and management API for the Polymarket BTC 5-minute engine"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
