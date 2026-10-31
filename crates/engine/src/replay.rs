@@ -349,7 +349,7 @@ pub async fn compare_with_stored(
         .filter(|(_, p)| p.0 > 0)
         .map(|(i, p)| (names[i].to_string(), p.0, p.1))
         .collect();
-    diffs.sort_by(|a, b| b.1.cmp(&a.1));
+    diffs.sort_by_key(|d| std::cmp::Reverse(d.1));
     diffs.truncate(10);
     c.differing_features = diffs;
     Ok(c)
