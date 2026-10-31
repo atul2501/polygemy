@@ -4,7 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Real order execution through Polymarket's official Rust SDK. Not built by default: a default build
+# cannot place orders at all.
+live = ["dep:polymarket_client_sdk_v2", "dep:alloy"]
+
 [dependencies]
+polymarket_client_sdk_v2 = { version = "=0.9.0", optional = true, features = ["clob"] }
+alloy = { version = "1.6.3", optional = true, default-features = false, features = ["signers", "signer-local"] }
 anyhow = "1"
 chrono = "0.4.45"
 fastrand = "2.5.0"

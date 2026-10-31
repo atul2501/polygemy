@@ -55,6 +55,36 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
         }
         "run" => run(cfg).await,
         "status" => status(cfg).await,
+        "live-check" => {
+            let pool = db::connect(&cfg.database_url, 1).await?;
+            let (ok, missing) = polygemy_engine::execution::readiness_complete(&pool).await?;
+            let leases: Vec<(String, String, chrono::DateTime<chrono::Utc>)> =
+                sqlx::query_as("SELECT account, holder, expires_at FROM execution_leases")
+                    .fetch_all(&pool)
+                    .await?;
+            let kill: bool = sqlx::query_scalar("SELECT engaged FROM kill_switch WHERE id = 1")
+                .fetch_one(&pool)
+                .await?;
+            println!("live execution compiled in: {}", cfg!(feature = "live"));
+            println!(
+                "trading mode: {}  execution enabled: {}",
+                cfg.trading_mode.as_str(),
+                cfg.execution_enabled
+            );
+            println!("kill switch engaged: {kill}");
+            println!(
+                "readiness complete: {ok}{}",
+                if ok {
+                    String::new()
+                } else {
+                    format!("  (unsigned: {})", missing.join(", "))
+                }
+            );
+            for (a, h, e) in leases {
+                println!("lease: account {a} held by {h} until {e}");
+            }
+            Ok(())
+        }
         "backtest" => {
             let arg = |i: usize| std::env::args().nth(i);
             let time = |i: usize| -> Result<i64> {
@@ -124,7 +154,22 @@ async fn dispatch(cmd: &str, cfg: &Config) -> Result<()> {
 
 async fn run(cfg: &Config) -> Result<()> {
     if cfg.trading_mode == TradingMode::Live {
-        bail!("live execution is not implemented yet; refusing to start in live mode");
+        // Live order flow is built and tested against a mock venue, but it stays switched off until
+        // it has been validated with a real, eligible account (docs/LIVE_READINESS.md).
+        let pool = db::connect(&cfg.database_url, 1).await?;
+        let (ok, missing) = polygemy_engine::execution::readiness_complete(&pool).await?;
+        if !ok {
+            bail!(
+                "live mode refused: readiness items not signed off: {}",
+                missing.join(", ")
+            );
+        }
+        if !cfg!(feature = "live") {
+            bail!(
+                "live mode refused: this build has no live execution (cargo build --features live)"
+            );
+        }
+        bail!("live mode refused: the live order path is not enabled in this release (see docs/LIVE_READINESS.md)");
     }
     let app_env = cfg.app_env.as_str();
     // Unique per process start; the execution lease (later phase) will be keyed on it.

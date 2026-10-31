@@ -4,9 +4,12 @@ pub mod clock;
 pub mod config;
 pub mod db;
 pub mod event;
+pub mod execution;
 pub mod features;
 pub mod feeds;
 pub mod health;
+#[cfg(feature = "live")]
+pub mod live_venue;
 pub mod market;
 pub mod monitor;
 pub mod persist;
