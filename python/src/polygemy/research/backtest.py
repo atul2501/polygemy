@@ -9,9 +9,7 @@ import math
 import os
 import subprocess
 import uuid
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from psycopg import Connection
 

@@ -1,7 +1,13 @@
 # Same file on the local PC and on Stockholm; the env file decides which environment it is.
 #   docker compose --env-file .env.local up -d       (local)
 #   docker compose --env-file .env.stockholm up -d   (Stockholm)
+# Sized for an 8 GB host: postgres ~2 GB, engine 512 MB, api 384 MB, backup 256 MB.
 name: polygemy
+
+x-logging: &logging
+  # Rotated container logs: at most 5 × 20 MB per service.
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
 
 x-engine: &engine
   image: polygemy-engine:${IMAGE_TAG:-dev}
@@ -14,6 +20,7 @@ x-engine: &engine
   environment:
     # Inside the compose network Postgres is "postgres", not 127.0.0.1.
     DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  logging: *logging
   depends_on:
     postgres:
       condition: service_healthy
@@ -26,11 +33,34 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
       POSTGRES_DB: ${POSTGRES_DB:?}
+    # Conservative memory and WAL settings for a small instance.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=40
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_timeout=15min
+    mem_limit: 2g
     # Loopback only: PostgreSQL is never exposed publicly. Reach Stockholm's through an SSH tunnel.
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    logging: *logging
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
@@ -48,6 +78,7 @@ services:
     command: ["run"]
     restart: unless-stopped
     stop_grace_period: 30s
+    mem_limit: 512m
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,5 +90,52 @@ services:
       timeout: 10s
       retries: 3
 
+  # API + dashboard. Loopback only: from the PC use `ssh -L 18000:127.0.0.1:8000 <vps>`.
+  api:
+    image: polygemy-api:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    env_file: ${ENV_FILE}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    mem_limit: 384m
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Nightly logical backup of the durable tables (raw partitions are excluded: they expire in
+  # 24 h by design). Keeps BACKUP_KEEP_DAYS dumps in the `backups` volume.
+  backup:
+    image: polygemy-backup:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      dockerfile: docker/backup.Dockerfile
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+    volumes:
+      - backups:/backups
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  backups:

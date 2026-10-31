@@ -39,6 +39,7 @@ impl Monitor {
         let mut bucket_start = now_us();
         let mut last_rows = 0u64;
         let mut ticks = 0u64;
+        let mut alerts = crate::hostmon::Alerts::default();
         loop {
             tokio::select! { _ = tick.tick() => {}, _ = shutdown.changed() => break }
             ticks += 1;
@@ -65,6 +66,7 @@ impl Monitor {
                 }
             }
             if ticks % 60 == 0 {
+                self.host_alerts(&mut alerts).await;
                 match persist::enforce_retention(&self.pool, self.retention).await {
                     Ok(r) => {
                         if !r.dropped.is_empty() {
@@ -76,6 +78,46 @@ impl Monitor {
                         }
                     }
                     Err(e) => warn!(error = format!("{e:#}"), "retention failed"),
+                }
+            }
+        }
+    }
+
+    /// Disk, RAM and database-budget alerts at 70 / 80 / 90 %, plus WAL size in the log.
+    async fn host_alerts(&self, alerts: &mut crate::hostmon::Alerts) {
+        let db_pct = persist::db_size(&self.pool)
+            .await
+            .ok()
+            .map(|b| b as f64 / self.retention.budget_bytes as f64 * 100.0);
+        let wal: Option<i64> = sqlx::query_scalar("SELECT sum(size)::bigint FROM pg_ls_waldir()")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        let samples = [
+            ("disk", crate::hostmon::disk_used_pct("/")),
+            ("ram", crate::hostmon::ram_used_pct()),
+            ("database_budget", db_pct),
+        ];
+        info!(disk_pct = ?samples[0].1, ram_pct = ?samples[1].1, db_budget_pct = ?db_pct, wal_mb = ?wal.map(|w| w / 1_048_576), "host resources");
+        for (name, pct) in samples {
+            let Some(pct) = pct else { continue };
+            if let Some((level, message)) = alerts.observe(name, pct) {
+                if level == "info" {
+                    info!(resource = name, pct, "{message}");
+                } else {
+                    warn!(resource = name, pct, "{message}");
+                }
+                let e = Event {
+                    instance_id: &self.instance_id,
+                    app_env: self.app_env,
+                    kind: "resource_alert",
+                    level,
+                    message: &message,
+                    details: json!({"resource": name, "pct": pct}),
+                };
+                if let Err(err) = db::record_event(&self.pool, e).await {
+                    warn!(error = format!("{err:#}"), "resource alert not recorded");
                 }
             }
         }

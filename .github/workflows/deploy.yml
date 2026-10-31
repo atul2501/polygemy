@@ -1,0 +1,32 @@
+# Production deployment: manual only, and gated by the `production` environment (configure
+# required reviewers under Settings -> Environments). Never runs on push.
+name: deploy-stockholm
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tested tag or commit to deploy"
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Refuse refs that did not pass CI
+        run: |
+          gh api "repos/${{ github.repository }}/commits/${{ inputs.ref }}/check-runs" --jq '[.check_runs[] | select(.name=="test") | .conclusion] | any(. == "success")' | grep -q true
+        env: { GH_TOKEN: "${{ github.token }}" }
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.STOCKHOLM_SSH_KEY }}
+          SSH_HOST: ${{ secrets.STOCKHOLM_SSH_HOST }}
+          SSH_KNOWN_HOSTS: ${{ secrets.STOCKHOLM_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          git fetch origin main
+          bash scripts/deploy.sh "$SSH_HOST" "${{ inputs.ref }}"

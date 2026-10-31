@@ -8,6 +8,7 @@ pub mod execution;
 pub mod features;
 pub mod feeds;
 pub mod health;
+pub mod hostmon;
 #[cfg(feature = "live")]
 pub mod live_venue;
 pub mod market;

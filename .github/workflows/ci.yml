@@ -1,0 +1,73 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.6-bookworm
+        env: { POSTGRES_USER: polygemy, POSTGRES_PASSWORD: ci-only, POSTGRES_DB: polygemy_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U polygemy" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      APP_ENV: local
+      TRADING_MODE: paper
+      DATABASE_URL: postgres://polygemy:ci-only@127.0.0.1:5432/polygemy_test
+      TEST_DATABASE_URL: postgres://polygemy:ci-only@127.0.0.1:5432/polygemy_test
+      LOG_FORMAT: pretty
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust format
+        run: cargo fmt --all --check
+      - name: Rust lint (default and live builds)
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p polygemy-engine --features live -- -D warnings
+      - name: Migrations apply cleanly and are idempotent
+        run: cargo run -q -p polygemy-engine -- migrate && cargo run -q -p polygemy-engine -- migrate && cargo run -q -p polygemy-engine -- check
+      - name: Rust tests
+        run: cargo test --workspace
+      - uses: astral-sh/setup-uv@v3
+        with: { version: "0.10.2" }
+      - name: Python lint and tests
+        working-directory: python
+        run: |
+          uv sync --frozen --extra research --extra api
+          uvx ruff@0.7.4 check src tests
+          uv run pytest -q
+      - uses: actions/setup-node@v4
+        with: { node-version: "20.18.0", cache: npm, cache-dependency-path: dashboard/package-lock.json }
+      - name: Dashboard lint and build
+        working-directory: dashboard
+        run: npm ci --no-audit --no-fund && npm run lint && npm run build
+
+  security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with: { token: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: astral-sh/setup-uv@v3
+        with: { version: "0.10.2" }
+      - name: Python dependency audit
+        working-directory: python
+        run: uv export --frozen --extra research --extra api --no-hashes > /tmp/req.txt && uvx pip-audit@2.7.3 -r /tmp/req.txt
+      - name: npm audit (high and above)
+        working-directory: dashboard
+        run: npm audit --audit-level=high
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f docker/engine.Dockerfile --build-arg GIT_SHA=${GITHUB_SHA::7} -t polygemy-engine:ci .
+      - run: docker build -f docker/api.Dockerfile -t polygemy-api:ci .
+      - run: docker build -f docker/backup.Dockerfile -t polygemy-backup:ci .
