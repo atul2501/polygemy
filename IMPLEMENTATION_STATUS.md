@@ -82,6 +82,10 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
   - Export works: 4,408 rows, 16 markets.
   - Training correctly refused: 9 valid markets, below the minimum.
   - No model approved; paper trading records NO_TRADE.
+- **Live vs replay on real data**, valid rows after warm-up (09:51–09:54 UTC, 180 rows):
+  - 199 of 207 features are bit-identical.
+  - 8 long-memory indicators differ by at most 6e-6. Likely cause: rare out-of-order records live; not yet proven.
+  - Inside warm-up, records re-sent on reconnect (deduplicated with their first arrival time) cause larger differences on rows that are already degraded.
 - **Process lesson:** a scripted text substitution silently failed, so a committed fix (Chainlink precision) was not actually in the code. Found by the real-data replay check and fixed with a regression test. Every substitution now asserts its anchor.
 
 ## Data collection
