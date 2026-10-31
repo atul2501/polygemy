@@ -11,3 +11,6 @@ node_modules/
 /backups/
 dashboard/node_modules/
 dashboard/dist/
+# research datasets (exports, downloaded history)
+/data/
+python/data/

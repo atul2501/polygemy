@@ -155,3 +155,61 @@ def test_twap_baseline_passes_probability_through():
     for p in [0.05, 0.3, 0.5, 0.8, 0.99]:
         x = np.log(p / (1 - p))
         assert abs(1 / (1 + np.exp(-(lg["coef"][0] * x + lg["intercept"]))) - p) < 1e-12
+
+
+def test_history_backtest_prices_spread_and_fee():
+    import pandas as pd
+
+    from polygemy.research import history
+
+    ts = pd.to_datetime(["2026-10-01T00:01:00Z", "2026-10-01T00:02:00Z"])
+    d = pd.DataFrame({"condition_id": ["a", "a"], "ts": ts, "y": [1.0, 1.0], "time_remaining_s": [240.0, 180.0], "mkt_age_s": [1.0, 1.0],
+                      "fill_1s": [0.5, 0.5], "p": [0.52, 0.8]})
+    t = history.backtest(d)  # first row: 0.52 - 0.51 - fee < 0.04, so the entry is the second row
+    assert len(t) == 1 and t.side.iloc[0] == "Up" and t.ts.iloc[0] == ts[1]
+    shares = 10 / 0.51
+    assert abs(t.pnl.iloc[0] - (shares * 0.49 - shares * 0.07 * 0.51 * 0.49)) < 1e-9
+    d["y"] = 0.0
+    assert history.backtest(d).pnl.iloc[0] < -9  # a loser costs the stake plus the fee
+    d["p"] = 0.1  # model prefers Down: buys Down at 1 - 0.5 + 0.01
+    t = history.backtest(d)
+    assert t.side.iloc[0] == "Down" and abs(t.price.iloc[0] - 0.51) < 1e-12 and t.pnl.iloc[0] > 0
+
+
+def test_history_twap_maths_matches_engine():
+    from polygemy.research import history
+
+    # Same cases as the engine's features::tests::twap_end_maths.
+    mean, sd = history._twap_end_gaussian(np.array([100.0, 100.0, 100.0]), np.array([np.nan, 101.0, 101.0]), np.array([300.0, 15.0, 0.0]), 0.5)
+    assert mean[0] == 100.0 and abs(sd[0] - 0.5 * np.sqrt(260)) < 1e-12
+    assert abs(mean[1] - 100.75) < 1e-12 and abs(sd[1] - 0.25 * 0.5 * np.sqrt(5)) < 1e-12
+    assert mean[2] == 101.0 and sd[2] == 0.0
+
+
+def test_maker_fills_only_when_a_trade_prints_through_the_bid(tmp_path):
+    import pandas as pd
+
+    from polygemy.research import history
+
+    (tmp_path / "trades").mkdir()
+    t0 = 1_800_000_000
+    snaps = pd.DataFrame({"condition_id": "a", "ts": pd.to_datetime([t0, t0 + 5], unit="s", utc=True), "fold": 0, "y": 1.0,
+                          "time_remaining_s": [200.0, 195.0], "mkt_p_up": [0.50, 0.50], "p": [0.60, 0.60]})
+    # Bid for Up at min(0.60 - 0.02, 0.50 - 0.01) = 0.49, live from t0 + 1 to t0 + 6 (API time = +2 s shift).
+    def trades(rows):
+        pd.DataFrame(rows, columns=["ts", "p_up", "size", "up_flow"]).assign(ts=lambda d: pd.to_datetime(d.ts, unit="s", utc=True)).to_parquet(tmp_path / "trades" / "a.parquet")
+
+    trades([(t0 + 4, 0.49, 5.0, -5.0)])  # sells Up at exactly our price: not through, no fill
+    assert history.maker_backtest(snaps, tmp_path).empty
+    trades([(t0 + 4, 0.48, 5.0, 5.0)])  # through our price but buying Up: does not hit a bid
+    assert history.maker_backtest(snaps, tmp_path).empty
+    trades([(t0 + 2, 0.48, 5.0, -5.0)])  # before our order is live (t0 + 2 - 2 s <= t0 + 1)
+    assert history.maker_backtest(snaps, tmp_path).empty
+    trades([(t0 + 5, 0.48, 5.0, -5.0)])  # sells through 0.49 while live: filled at our limit
+    t = history.maker_backtest(snaps, tmp_path)
+    assert len(t) == 1 and t.side.iloc[0] == "Up" and t.price.iloc[0] == 0.49
+    assert abs(t.pnl.iloc[0] - 10 / 0.49 * 0.51) < 1e-9
+    # Model prefers Down (p 0.40 < market 0.50): Down bid 0.49 fills on Up buying through 1 - 0.49.
+    trades([(t0 + 5, 0.52, 5.0, 5.0)])
+    t = history.maker_backtest(snaps.assign(p=0.40), tmp_path)
+    assert len(t) == 1 and t.side.iloc[0] == "Down" and t.price.iloc[0] == 0.49 and t.pnl.iloc[0] < 0

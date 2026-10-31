@@ -10,6 +10,8 @@
   python -m polygemy.research metrics  RUN_ID [--mode backtest]
   python -m polygemy.research walkforward --data data/ds1 --engine ../target/release/polygemy-engine [--groups combined,technical,...]
   python -m polygemy.research sync     --source URL --from 2026-11-01 --to 2026-11-08   (into DATABASE_URL)
+  python -m polygemy.research history-download --days 14 --out data/history   (public historical markets)
+  python -m polygemy.research history-eval --data data/history [--kind lightgbm]  (out-of-sample vs market + backtest)
 
 DATABASE_URL selects the database (local, or Stockholm through an SSH tunnel).
 """
@@ -21,9 +23,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import psycopg
 
-from . import backtest, dataset, models, registry, train
+from . import backtest, dataset, history, models, registry, train
 
 
 def ts(s: str) -> datetime:
@@ -67,7 +70,21 @@ def main(argv=None) -> int:
     sy.add_argument("--source", required=True)
     sy.add_argument("--from", dest="start", type=ts, required=True)
     sy.add_argument("--to", dest="end", type=ts, required=True)
+    hd = sub.add_parser("history-download")
+    hd.add_argument("--days", type=int, default=14)
+    hd.add_argument("--out", type=Path, default=Path("data/history"))
+    he = sub.add_parser("history-eval")
+    he.add_argument("--data", type=Path, default=Path("data/history"))
+    he.add_argument("--kind", default="lightgbm")
     a = p.parse_args(argv)
+    if a.cmd == "history-download":  # public data only; needs no database
+        history.download(a.out, a.days, log=lambda s: print(s, flush=True))
+        return 0
+    if a.cmd == "history-eval":
+        df = history.features(a.data, log=lambda s: print(s, flush=True))
+        df.to_parquet(a.data / "features.parquet")
+        print(json.dumps(history.evaluate(df, a.kind, log=lambda s: print(s, flush=True)), indent=2))
+        return 0
 
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         if a.cmd == "export":
