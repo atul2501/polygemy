@@ -16,7 +16,7 @@ use crate::features::{FeatureEngine, MarketCtx, Symbols};
 use crate::persist::{BookSnapshot, ChainlinkReport, FeatureRow, Record};
 
 /// Feature history needs this much lead-in before the first compared second.
-pub const WARMUP_US: i64 = 600 * 1_000_000;
+pub const WARMUP_US: i64 = crate::features::WARMUP_US;
 const CHUNK_US: i64 = 300 * 1_000_000;
 
 fn source(s: &str) -> Option<Source> {
@@ -228,19 +228,29 @@ pub async fn markets(pool: &PgPool, from_us: i64, to_us: i64) -> Result<Vec<Mark
         .collect())
 }
 
-/// Replays [from - warm-up, to) and returns the feature rows inside [from, to).
+/// Replays [start, to) and returns the feature rows inside [from, to). `start` is from minus the
+/// warm-up, but never before the last live engine start: the live engine had no earlier history,
+/// and long-memory indicators would otherwise differ.
 pub async fn replay_features(
     pool: &PgPool,
     symbols: Symbols,
     from_us: i64,
     to_us: i64,
 ) -> Result<Vec<FeatureRow>> {
+    let last_start: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT max(ts) FROM system_events WHERE kind = 'engine_start' AND ts <= $1",
+    )
+    .bind(to_datetime(from_us))
+    .fetch_one(pool)
+    .await?;
+    let start =
+        (from_us - WARMUP_US).max(last_start.map(|t| t.timestamp_micros()).unwrap_or(i64::MIN));
     let mut engine = FeatureEngine::new(symbols, "replay".into());
-    engine.set_markets(markets(pool, from_us - crate::replay::WARMUP_US, to_us).await?);
+    engine.set_markets(markets(pool, start, to_us).await?);
     let mut rows = Vec::new();
     // Read past `to` so the watermark passes the last second (live always has later records).
     let read_to = to_us + crate::features::WATERMARK_US + 2_000_000;
-    let mut t = from_us - WARMUP_US;
+    let mut t = start;
     while t < read_to {
         let end = (t + CHUNK_US).min(read_to);
         for r in load_records(pool, t, end).await? {
@@ -265,6 +275,8 @@ pub struct Comparison {
     pub only_replayed: usize,
     pub only_stored: usize,
     pub max_abs_diff: f64,
+    /// Features that differed, with how many rows and the largest difference (top 10).
+    pub differing_features: Vec<(String, usize, f64)>,
 }
 
 /// Compares replayed rows with those stored live (same market and second).
@@ -289,10 +301,25 @@ pub async fn compare_with_stored(
         stored: by_key.len(),
         ..Default::default()
     };
+    let names = crate::features::FeatureEngine::names();
+    let mut per: Vec<(usize, f64)> = vec![(0, 0.0); names.len()];
     for r in rows {
         match by_key.remove(&(r.condition_id.clone(), r.ts_us)) {
             None => c.only_replayed += 1,
             Some(s) => {
+                for (i, (a, b)) in s.iter().zip(&r.features).enumerate() {
+                    let d = if a.is_nan() && b.is_nan() {
+                        0.0
+                    } else if a.is_nan() || b.is_nan() {
+                        f64::INFINITY
+                    } else {
+                        (a - b).abs()
+                    };
+                    if d > 0.0 {
+                        per[i].0 += 1;
+                        per[i].1 = per[i].1.max(d);
+                    }
+                }
                 let diff = s
                     .iter()
                     .zip(&r.features)
@@ -316,5 +343,14 @@ pub async fn compare_with_stored(
         }
     }
     c.only_stored = by_key.len();
+    let mut diffs: Vec<(String, usize, f64)> = per
+        .into_iter()
+        .enumerate()
+        .filter(|(_, p)| p.0 > 0)
+        .map(|(i, p)| (names[i].to_string(), p.0, p.1))
+        .collect();
+    diffs.sort_by(|a, b| b.1.cmp(&a.1));
+    diffs.truncate(10);
+    c.differing_features = diffs;
     Ok(c)
 }

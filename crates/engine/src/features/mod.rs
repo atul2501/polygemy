@@ -30,6 +30,9 @@ pub const REFERENCE_TOLERANCE_US: i64 = 5 * SECOND;
 /// Inputs older than this mark a snapshot degraded.
 const STALE_US: i64 = 5 * SECOND;
 const LARGE_TRADE_BTC: f64 = 1.0;
+/// After the first record (engine start), snapshots are degraded until long-memory indicators
+/// (EMA50 / Wilder smoothing on 5 s bars) have converged; replay starts from the same point.
+pub const WARMUP_US: i64 = 1200 * SECOND;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarketCtx {
@@ -345,6 +348,7 @@ pub struct FeatureEngine {
     vwap: HashMap<String, (f64, f64)>,
     degraded: bool,
     pub late_records: u64,
+    warm_from_us: Option<i64>,
 }
 
 impl FeatureEngine {
@@ -367,6 +371,7 @@ impl FeatureEngine {
             vwap: HashMap::new(),
             degraded: false,
             late_records: 0,
+            warm_from_us: None,
         }
     }
 
@@ -406,6 +411,7 @@ impl FeatureEngine {
     /// Adds a record; returns the feature rows of every second boundary passed by the watermark.
     pub fn push(&mut self, r: Arc<Record>) -> Vec<FeatureRow> {
         let t = r.received_us();
+        self.warm_from_us.get_or_insert(t + WARMUP_US);
         self.max_seen = self.max_seen.max(t);
         self.seq += 1;
         self.pending.insert((t, self.seq), r);
@@ -487,7 +493,8 @@ impl FeatureEngine {
         for m in active {
             let f = self.compute(s, &m);
             let missing = f.vals.iter().filter(|v| v.is_nan()).count() as i16;
-            let degraded = self.degraded || self.critical_missing(s, &m);
+            let warming = self.warm_from_us.is_none_or(|w| s < w);
+            let degraded = self.degraded || warming || self.critical_missing(s, &m);
             out.push(FeatureRow {
                 ts_us: s,
                 condition_id: m.condition_id.clone(),
@@ -1070,8 +1077,12 @@ mod tests {
 
     /// A deterministic 400 s stream exercising every input type.
     fn stream() -> Vec<Arc<Record>> {
+        stream_n(400)
+    }
+
+    fn stream_n(n: i64) -> Vec<Arc<Record>> {
         let mut v = Vec::new();
-        for i in 0..400 {
+        for i in 0..n {
             let t = T0 + i * SECOND;
             let px = 77_000.0 + (i as f64 * 0.3).sin() * 20.0 + i as f64 * 0.1;
             v.push(trade(
@@ -1168,7 +1179,7 @@ mod tests {
             .find(|r| r.ts_us == market().start_us + 5 * SECOND)
             .unwrap();
         assert!(later.features[idx("price_to_beat")].is_finite());
-        assert!(!later.degraded, "all inputs present and fresh");
+        assert!(later.degraded, "inside the engine warm-up");
         let delay = later.features[idx("cl_source_delay_ms")];
         assert!((delay - 1210.0).abs() < 1e-6, "{delay}"); // fixture: TWAP received 1.21 s after source time
         assert!(
@@ -1182,6 +1193,30 @@ mod tests {
         assert!((0.0..=1.0).contains(&warm.features[idx("p_analytic")]));
         assert!((later.features[idx("implied_p_up")] - 0.5).abs() < 1e-9);
         assert!((later.features[idx("up_bid_px1")] - 0.48).abs() < 1e-12);
+    }
+
+    #[test]
+    fn valid_after_warmup_when_inputs_are_fresh() {
+        let mut e = FeatureEngine::new(syms(), "t".into());
+        let late = MarketCtx {
+            condition_id: "late".into(),
+            start_us: T0 + 1300 * SECOND,
+            end_us: T0 + 1600 * SECOND,
+            up_token: "up".into(),
+            down_token: "dn".into(),
+            twap: true,
+        };
+        e.set_markets([late.clone()]);
+        let rows: Vec<FeatureRow> = stream_n(1700).into_iter().flat_map(|r| e.push(r)).collect();
+        let r = rows
+            .iter()
+            .find(|r| r.ts_us == late.start_us + 5 * SECOND)
+            .unwrap();
+        assert!(!r.degraded, "warm, all inputs present and fresh");
+        assert!(rows
+            .iter()
+            .filter(|r| r.ts_us < T0 + WARMUP_US)
+            .all(|r| r.degraded));
     }
 
     #[test]
