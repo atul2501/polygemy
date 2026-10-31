@@ -12,15 +12,16 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
 | 4 Strategy, positions, risk | done | `5891f91` |
 | 6 Simulation | done | `5891f91`, `49bf12a` |
 | 5 Execution | done; live order path deliberately not enabled | `7ada4af` |
-| 7 Dashboard | **in progress** | |
-| 8 AWS / DevOps | not started | |
-| 9 Integration and validation | not started | |
+| 7 Dashboard | done | `ca5561e` |
+| 8 AWS / DevOps | done locally; not deployed (no AWS access) | `b1e3360` |
+| 9 Integration and validation | done to the extent data allows (see below) | `f28490f`, `6ecda34` |
 
 ## Test results
 
 - Before Phase 3: 61 Rust, 9 Python, 3 credential-script tests.
 - After Phase 3: 79 Rust, 17 Python.
-- After Phase 5: **113 Rust, 19 Python** (plus the 3 credential-script tests). All passing; clippy clean (default and `--features live`).
+- After Phase 5: 113 Rust, 19 Python.
+- Final: **115 Rust** (incl. a real-time end-to-end test), **25 Python**, dashboard lint plus type-check plus build, 3 credential-script tests. All passing; clippy clean (default and `--features live`); ruff clean; pip-audit clean; npm audit: no high (11 moderate, dev-only lint chain).
 
 ## Phase 3 summary
 
@@ -62,6 +63,27 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
   - Chainlink precision was not canonical
   - indicator values depended on engine uptime: 20-minute warm-up added, and replay now starts at the engine start
 
+## Phases 7–9 summary
+
+- **Dashboard:**
+  - FastAPI with Argon2 users and roles, hashed sessions, an audited kill switch, a live WebSocket, and a no-secrets test.
+  - React/TS: 7 views, colour-coded by mode, with a backend switch for the SSH tunnel.
+  - All views verified on real local data. The rendering itself was not seen by eye (no browser extension).
+- **DevOps:**
+  - Compose sized for 8 GB; measured ~210 MB for the whole stack.
+  - Backups plus a restore test (verified locally).
+  - Deploy script with automatic rollback (not exercised end to end), remote management, hardening, CI, and a gated deploy workflow.
+- **Validation:**
+  - Real-time e2e test passes.
+  - Latency bench: features p99 21 µs, LightGBM p99 12 µs, strategy+risk p99 8 µs.
+  - Pre-registered criteria in docs/VALIDATION.md; readiness checklist.
+- **Real data (31 Oct):**
+  - Settlement rule confirmed on 18/18 markets.
+  - Export works: 4,408 rows, 16 markets.
+  - Training correctly refused: 9 valid markets, below the minimum.
+  - No model approved; paper trading records NO_TRADE.
+- **Process lesson:** a scripted text substitution silently failed, so a committed fix (Chainlink precision) was not actually in the code. Found by the real-data replay check and fixed with a regression test. Every substitution now asserts its anchor.
+
 ## Data collection
 
 Continuous paper-mode collection on the local PC started 31 Oct 2026 ~07:40 UTC (`make up`). Only runs while the PC is on; Polymarket hosts reset intermittently on this network.
@@ -82,4 +104,6 @@ Continuous paper-mode collection on the local PC started 31 Oct 2026 ~07:40 UTC 
 
 ## Next step
 
-Phase 7: FastAPI (auth, roles, read endpoints, audited kill switch, live WebSocket) plus the React/TS dashboard. Migration `0007`.
+1. **Stockholm:** give SSH access (or run `scripts/deploy.sh`). Derive `POLY_API_*` for `.env.stockholm`. Start collection.
+2. **Collect** ≥ 2,000 markets (~7 days). Then `polygemy.research sync` → `export` → `train` → `walkforward`, and judge against docs/VALIDATION.md.
+3. **If criteria pass:** promote, then paper on Stockholm (14 days), then shadow (7 days), then readiness sign-off.

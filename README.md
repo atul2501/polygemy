@@ -2,9 +2,9 @@
 
 An event-driven trading engine for Polymarket's 5-minute BTC Up/Down markets. You develop and research on your PC, and a Stockholm VPS runs it in production. Both use the same code, the same Docker images, and the same PostgreSQL migration history.
 
-> Status: **Phase 2 (market infrastructure)**. Market discovery, the lifecycle state machine, and data collectors for Binance, Coinbase, Deribit, Chainlink and Polymarket CLOB are built; there is no prediction, strategy or order code yet. The engine refuses to start in `live` mode.
+> Status: **Phases 1–9 implemented**; see IMPLEMENTATION_STATUS.md. The engine runs in paper mode: market discovery, data collection, features, prediction (once a model is approved), strategy, risk, simulated execution, settlement and the dashboard. **No model is approved yet**, because there isn't enough labelled data, so no strategy result exists. Live trading is disabled (docs/LIVE_READINESS.md).
 >
-> See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md), which covers setup, Stockholm deployment, credentials and troubleshooting.
+> Docs: [ARCHITECTURE](docs/ARCHITECTURE.md), [OPERATIONS](docs/OPERATIONS.md), [DEPLOYMENT](docs/DEPLOYMENT.md), [VALIDATION](docs/VALIDATION.md), [LIVE_READINESS](docs/LIVE_READINESS.md).
 
 ## Layout
 

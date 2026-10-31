@@ -275,6 +275,9 @@ pub struct Comparison {
     pub only_replayed: usize,
     pub only_stored: usize,
     pub max_abs_diff: f64,
+    /// Rows stored with quality 'valid' (the only rows used for training and trading).
+    pub valid_rows: usize,
+    pub differing_valid: usize,
     /// Features that differed, with how many rows and the largest difference (top 10).
     pub differing_features: Vec<(String, usize, f64)>,
 }
@@ -286,15 +289,15 @@ pub async fn compare_with_stored(
     from_us: i64,
     to_us: i64,
 ) -> Result<Comparison> {
-    let stored: Vec<(String, DateTime<Utc>, Vec<f64>)> = sqlx::query_as("SELECT condition_id, ts, features FROM feature_snapshots WHERE ts >= $1 AND ts < $2 AND feature_version = $3")
+    let stored: Vec<(String, DateTime<Utc>, Vec<f64>, String)> = sqlx::query_as("SELECT condition_id, ts, features, quality FROM feature_snapshots WHERE ts >= $1 AND ts < $2 AND feature_version = $3")
         .bind(to_datetime(from_us))
         .bind(to_datetime(to_us))
         .bind(crate::features::FEATURE_VERSION)
         .fetch_all(pool)
         .await?;
-    let mut by_key: HashMap<(String, i64), Vec<f64>> = stored
+    let mut by_key: HashMap<(String, i64), (Vec<f64>, bool)> = stored
         .into_iter()
-        .map(|(c, t, f)| ((c, t.timestamp_micros()), f))
+        .map(|(c, t, f, q)| ((c, t.timestamp_micros()), (f, q == "valid")))
         .collect();
     let mut c = Comparison {
         replayed: rows.len(),
@@ -306,7 +309,8 @@ pub async fn compare_with_stored(
     for r in rows {
         match by_key.remove(&(r.condition_id.clone(), r.ts_us)) {
             None => c.only_replayed += 1,
-            Some(s) => {
+            Some((s, valid)) => {
+                c.valid_rows += usize::from(valid);
                 for (i, (a, b)) in s.iter().zip(&r.features).enumerate() {
                     let d = if a.is_nan() && b.is_nan() {
                         0.0
@@ -338,6 +342,7 @@ pub async fn compare_with_stored(
                     c.matched += 1;
                 } else {
                     c.differing += 1;
+                    c.differing_valid += usize::from(valid);
                 }
             }
         }

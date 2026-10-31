@@ -192,9 +192,12 @@ pub fn validate_identity(p: &Value, stream: Stream) -> Result<()> {
 
 /// Exact value (prefers `full_accuracy_value`) with unit sanity bounds.
 pub fn point_value(point: &Value) -> Result<Decimal> {
+    // Canonicalised to the stored precision exactly as PostgreSQL rounds NUMERIC(24, 8) (half away
+    // from zero; rust_decimal's default is banker's rounding), so live and replayed values match.
     let v = dec(&point["full_accuracy_value"])
         .or_else(|| dec(&point["value"]))
-        .context("missing value")?;
+        .context("missing value")?
+        .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
     if v < Decimal::from(MIN_PRICE) || v > Decimal::from(MAX_PRICE) {
         bail!("value {v} outside BTC/USD bounds: wrong feed or units");
     }
@@ -236,5 +239,20 @@ impl Session for Chainlink {
     fn idle_timeout(&self) -> Duration {
         // Server pings every 25 s; prices update ~every second.
         Duration::from_secs(60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Found by the real-data replay check: midpoints must round like PostgreSQL NUMERIC.
+    #[test]
+    fn rounds_like_postgres_numeric() {
+        let v = |s: &str| point_value(&json!({"full_accuracy_value": s})).unwrap().to_string();
+        assert_eq!(v("77304.030964845"), "77304.03096485", "half away from zero, not to even");
+        assert_eq!(v("77304.030964835"), "77304.03096484");
+        assert_eq!(v("77304.030964834999"), "77304.03096483");
     }
 }
