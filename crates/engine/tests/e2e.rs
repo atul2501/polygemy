@@ -170,7 +170,7 @@ async fn full_market_lifecycle_paper_trade_settlement_and_audit() {
         "ws://unused".into(),
         state.clone(),
     );
-    let (up2, down2) = (up.clone(), down.clone());
+    let up2 = up.clone();
     let book = move |asset: &str| {
         let (bid, ask) = if asset == up2 {
             ("0.54", "0.55")

@@ -46,7 +46,10 @@ def test_short_horizon_labels_use_arrived_reports_and_future_source_time():
 def test_labels_accept_database_timezones():
     # Found on real data: the database returns Etc/UTC, pandas builds UTC.
     t = pd.Timestamp("2026-01-01", tz="UTC")
-    rep = pd.DataFrame({"observed_ts": [t - pd.Timedelta(seconds=2), t + pd.Timedelta(seconds=7)], "received_ts": [t - pd.Timedelta(seconds=1), t + pd.Timedelta(seconds=10)], "value": [1.0, 2.0]})
+    s = pd.Timedelta(seconds=1)
+    # p0 = 1.0 (arrived by t); target t-2+10 = t+8 -> latest report observed by then is 2.0 (Up);
+    # a later report proves the data covers the horizon.
+    rep = pd.DataFrame({"observed_ts": [t - 2 * s, t + 7 * s, t + 11 * s], "received_ts": [t - s, t + 8 * s, t + 12 * s], "value": [1.0, 2.0, 0.5]})
     rep = rep.assign(observed_ts=rep["observed_ts"].dt.tz_convert("Etc/UTC"), received_ts=rep["received_ts"].dt.tz_convert("Etc/UTC"))
     assert dataset.short_horizon_labels(pd.Series([t]), rep, 10)[0] == 1.0
 
