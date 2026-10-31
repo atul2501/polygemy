@@ -1,12 +1,13 @@
-"""Historical BTC 5-minute markets from public sources, for research on far more markets than we
-have recorded live.
+"""Historical Up/Down markets from public sources, for research on far more markets than we
+have recorded live. BTC 5-minute by default; any Chainlink-TWAP series via --series/--symbol/--window.
 
   python -m polygemy.research history-download --days 14 --out data/history
+  python -m polygemy.research history-download --days 30 --out data/history_btc15 --series btc-up-or-down-15m --window 900
 
 - Polymarket Gamma: every closed market with its outcome and the official Chainlink settlement
   values (eventMetadata.priceToBeat / finalPrice).
 - Polymarket data-api: taker trades per market, to the second.
-- Binance data.binance.vision: BTCUSDT 1-second klines.
+- Binance data.binance.vision: 1-second klines of the matching symbol (BTCUSDT, ETHUSDT).
 
 Everything is cached as Parquet under OUT and the download resumes where it stopped. There is no
 order book and no intra-window Chainlink path in this data; see `features` for how that is handled.
@@ -25,8 +26,14 @@ import pandas as pd
 
 GAMMA = "https://gamma-api.polymarket.com/events"
 TRADES = "https://data-api.polymarket.com/trades"
-BINANCE = "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1s/BTCUSDT-1s-{day}.zip"
-SERIES = "btc-up-or-down-5m"
+BINANCE = "https://data.binance.vision/data/spot/daily/klines/{symbol}/1s/{symbol}-1s-{day}.zip"
+# What a data folder holds; written to OUT/meta.json by `download`.
+DEFAULT_META = {"series": "btc-up-or-down-5m", "symbol": "BTCUSDT", "window_s": 300}
+
+
+def meta(root: Path) -> dict:
+    f = root / "meta.json"
+    return json.loads(f.read_text()) if f.exists() else dict(DEFAULT_META)
 MIN_INTERVAL_S = 0.25  # at most ~4 requests/s; 429s back off further
 
 
@@ -58,22 +65,22 @@ def _utc(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def markets(c: Client, start: datetime, end: datetime) -> pd.DataFrame:
+def markets(c: Client, start: datetime, end: datetime, series: str = DEFAULT_META["series"], window_s: int = 300) -> pd.DataFrame:
     """Closed markets whose window ends in [start, end), with outcome and settlement values.
     Fetched one day at a time: Gamma refuses offsets beyond ~2,000."""
     rows = []
     day = start
     while day < end:
-        rows += _market_rows(c, day, min(day + timedelta(days=1), end))
+        rows += _market_rows(c, day, min(day + timedelta(days=1), end), series)
         day += timedelta(days=1)
     df = pd.DataFrame(rows).drop_duplicates("condition_id")
-    return df[(df.end - df.start) == pd.Timedelta(minutes=5)].sort_values("start").reset_index(drop=True)
+    return df[(df.end - df.start) == pd.Timedelta(seconds=window_s)].sort_values("start").reset_index(drop=True)
 
 
-def _market_rows(c: Client, start: datetime, end: datetime) -> list[dict]:
+def _market_rows(c: Client, start: datetime, end: datetime, series: str) -> list[dict]:
     rows, offset = [], 0
     while True:
-        page = json.loads(c.get(GAMMA, {"series_slug": SERIES, "closed": "true", "limit": 500, "offset": offset, "order": "endDate", "ascending": "false",
+        page = json.loads(c.get(GAMMA, {"series_slug": series, "closed": "true", "limit": 500, "offset": offset, "order": "endDate", "ascending": "false",
                                          "end_date_min": start.isoformat(), "end_date_max": end.isoformat()}).text, strict=False)
         for e in page:
             for m in e.get("markets", []):
@@ -126,28 +133,33 @@ def trades(c: Client, condition_id: str, page: int = 10000, max_pages: int = 3) 
     return out.sort_values("ts", kind="stable").reset_index(drop=True)
 
 
-def binance_day(c: Client, day: date) -> pd.DataFrame:
-    r = c.get(BINANCE.format(day=day.isoformat()))
+def binance_day(c: Client, day: date, symbol: str = "BTCUSDT") -> pd.DataFrame:
+    r = c.get(BINANCE.format(symbol=symbol, day=day.isoformat()))
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         raw = pd.read_csv(z.open(z.namelist()[0]), header=None, usecols=[0, 4, 5], names=["open_time", "close", "volume"])
     unit = "us" if raw.open_time.iloc[0] > 1e14 else "ms"  # Binance spot archives switched to µs in 2025
     return pd.DataFrame({"ts": pd.to_datetime(raw.open_time, unit=unit, utc=True), "close": raw.close.astype(float), "volume": raw.volume.astype(float)})
 
 
-def download(out: Path, days: int, end: datetime | None = None, log=print) -> None:
+def download(out: Path, days: int, series: str = DEFAULT_META["series"], symbol: str = DEFAULT_META["symbol"], window_s: int = 300,
+             end: datetime | None = None, log=print) -> None:
     end = end or datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=days)
     c = Client()
     (out / "trades").mkdir(parents=True, exist_ok=True)
     (out / "binance").mkdir(parents=True, exist_ok=True)
+    want = {"series": series, "symbol": symbol, "window_s": window_s}
+    if (out / "meta.json").exists() and meta(out) != want:
+        raise SystemExit(f"{out} holds {meta(out)}, not {want}: use another --out")
+    (out / "meta.json").write_text(json.dumps(want))
     for d in range(days + 1):
         day = (start + timedelta(days=d)).date()
         f = out / "binance" / f"{day}.parquet"
         if not f.exists() and day < datetime.now(timezone.utc).date():
-            binance_day(c, day).to_parquet(f)
+            binance_day(c, day, symbol).to_parquet(f)
     log(f"binance: {len(list((out / 'binance').glob('*.parquet')))} days")
     mf = out / "markets.parquet"
-    m = markets(c, start, end)
+    m = markets(c, start, end, series, window_s)
     if mf.exists():
         m = pd.concat([pd.read_parquet(mf), m]).drop_duplicates("condition_id").sort_values("start").reset_index(drop=True)
     m.to_parquet(mf)
@@ -196,6 +208,7 @@ def features(root: Path, log=print, trade_shift_s: int = TRADE_SHIFT_S) -> pd.Da
     lr[np.r_[True, np.diff(bn_t) != 1]] = 0.0  # no return across gaps
     csum, csum2 = np.cumsum(lr), np.cumsum(lr**2)
     m = pd.read_parquet(root / "markets.parquet")
+    W = meta(root)["window_s"]
     out = []
     for i, mk in enumerate(m.itertuples(), 1):
         tf = root / "trades" / f"{mk.condition_id}.parquet"
@@ -203,7 +216,7 @@ def features(root: Path, log=print, trade_shift_s: int = TRADE_SHIFT_S) -> pd.Da
             continue
         tr = pd.read_parquet(tf)
         s0 = int(mk.start.timestamp())
-        grid = np.arange(s0 + 10, s0 + 300, STEP_S)
+        grid = np.arange(s0 + 10, s0 + W, STEP_S)
         j = np.searchsorted(bn_t, grid, side="right") - 1
         j0 = np.searchsorted(bn_t, s0, side="right") - 1
         if j0 < 300 or (grid - bn_t[j]).max() > 5:
@@ -223,9 +236,9 @@ def features(root: Path, log=print, trade_shift_s: int = TRADE_SHIFT_S) -> pd.Da
         v60, v300 = vol(60), vol(300)
         sigma = mk.price_to_beat * np.sqrt((v60**2 + v300**2) / 2) / 1e4
         est = mk.price_to_beat * px / start_px  # estimated Chainlink spot
-        t_rem = (s0 + 300 - grid).astype(float)
+        t_rem = (s0 + W - grid).astype(float)
         # Mean of the estimated spot path already inside the final 60 s window.
-        w0 = np.searchsorted(bn_t, s0 + 240, side="right") - 1
+        w0 = np.searchsorted(bn_t, s0 + W - 60, side="right") - 1
         obs_sum = np.cumsum(np.r_[0.0, mk.price_to_beat * bn_px[w0:j[-1] + 1] / start_px])
         k = np.clip(j - w0 + 1, 0, None)  # observations from the window start up to and including now
         observed = np.where(k > 0, obs_sum[k] / np.maximum(k, 1), est)
@@ -362,7 +375,8 @@ def evaluate(df: pd.DataFrame, kind: str = "lightgbm", n_splits: int = 4, log=pr
     cmp_ = o[o.mkt_p_up.notna() & (o.mkt_age_s <= 30)]
     b = lambda x: round(float(np.mean((x - cmp_.y.loc[x.index]) ** 2)), 4)  # noqa: E731
     by_t = []
-    for lo, hi in [(0, 60), (60, 120), (120, 180), (180, 240), (240, 300)]:
+    edges = [0, 60, 120, 180, 240, 300] + ([int(cmp_.time_remaining_s.max())] if cmp_.time_remaining_s.max() > 300 else [])
+    for lo, hi in zip(edges[:-1], edges[1:]):
         g = cmp_[(cmp_.time_remaining_s > lo) & (cmp_.time_remaining_s <= hi)]
         by_t.append({"time_left": f"{lo}-{hi}s", "rows": len(g), "markets": g.condition_id.nunique(),
                      "model": b(g.p), "market": b(g.mkt_p_up), "p_twap": b(g.p_twap)})

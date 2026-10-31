@@ -73,12 +73,15 @@ def main(argv=None) -> int:
     hd = sub.add_parser("history-download")
     hd.add_argument("--days", type=int, default=14)
     hd.add_argument("--out", type=Path, default=Path("data/history"))
+    hd.add_argument("--series", default=history.DEFAULT_META["series"])
+    hd.add_argument("--symbol", default=history.DEFAULT_META["symbol"])
+    hd.add_argument("--window", type=int, default=history.DEFAULT_META["window_s"], help="market length in seconds")
     he = sub.add_parser("history-eval")
     he.add_argument("--data", type=Path, default=Path("data/history"))
     he.add_argument("--kind", default="lightgbm")
     a = p.parse_args(argv)
     if a.cmd == "history-download":  # public data only; needs no database
-        history.download(a.out, a.days, log=lambda s: print(s, flush=True))
+        history.download(a.out, a.days, a.series, a.symbol, a.window, log=lambda s: print(s, flush=True))
         return 0
     if a.cmd == "history-eval":
         df = history.features(a.data, log=lambda s: print(s, flush=True))
