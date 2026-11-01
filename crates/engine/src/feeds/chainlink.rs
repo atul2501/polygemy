@@ -1,4 +1,4 @@
-//! Chainlink BTC/USD reference prices via Polymarket's PolyBolt stream (CLOB API credentials).
+//! Chainlink reference prices of this instance's asset (`crate::asset`, BTC by default) via Polymarket's PolyBolt stream (CLOB API credentials).
 //!
 //! The 5-minute BTC markets resolve on Chainlink's BTC/USD **60-second TWAP** data stream (per the
 //! market description), so two feeds are collected, one connection each:
@@ -27,10 +27,10 @@ pub enum Stream {
 }
 
 impl Stream {
-    pub fn feed(self) -> &'static str {
+    pub fn feed(self) -> String {
         match self {
-            Stream::Spot => "btcusd",
-            Stream::Twap60 => "btcusd_twap60",
+            Stream::Spot => crate::asset::spot_feed(),
+            Stream::Twap60 => crate::asset::twap_feed(),
         }
     }
 
@@ -43,8 +43,12 @@ impl Stream {
 
     fn filter(self) -> Value {
         match self {
-            Stream::Spot => json!({"symbol": "btcusd", "provider": "chainlink"}),
-            Stream::Twap60 => json!({"symbol": "btcusd", "window_seconds": 60}),
+            Stream::Spot => {
+                json!({"symbol": crate::asset::current().chainlink, "provider": "chainlink"})
+            }
+            Stream::Twap60 => {
+                json!({"symbol": crate::asset::current().chainlink, "window_seconds": 60})
+            }
         }
     }
 }
@@ -62,10 +66,6 @@ impl std::fmt::Debug for Credentials {
         write!(f, "Credentials(***)")
     }
 }
-
-/// BTC/USD plausibility bounds: a value outside them is a unit/feed error, not a price.
-const MIN_PRICE: i64 = 1_000;
-const MAX_PRICE: i64 = 10_000_000;
 
 pub struct Chainlink {
     pub ctx: Ctx,
@@ -175,7 +175,7 @@ impl Chainlink {
 
 /// Feed identity: right symbol, Chainlink as the producer, and the 60 s window for TWAP.
 pub fn validate_identity(p: &Value, stream: Stream) -> Result<()> {
-    if p["symbol"] != "btcusd" {
+    if p["symbol"] != crate::asset::current().chainlink {
         bail!("unexpected symbol {}", p["symbol"]);
     }
     if p["source"] != "chainlink" {
@@ -198,8 +198,14 @@ pub fn point_value(point: &Value) -> Result<Decimal> {
         .or_else(|| dec(&point["value"]))
         .context("missing value")?
         .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-    if v < Decimal::from(MIN_PRICE) || v > Decimal::from(MAX_PRICE) {
-        bail!("value {v} outside BTC/USD bounds: wrong feed or units");
+    // Plausibility bounds of the asset: a value outside them is a unit/feed error, not a price.
+    let (lo, hi) = crate::asset::current().bounds;
+    let x = v.to_string().parse::<f64>().unwrap_or(f64::NAN);
+    if !(lo..=hi).contains(&x) {
+        bail!(
+            "value {v} outside {} bounds: wrong feed or units",
+            crate::asset::current().pair
+        );
     }
     Ok(v)
 }

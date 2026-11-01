@@ -52,6 +52,48 @@ open http://127.0.0.1:8000                              # dashboard
 
 The instance runs on its own. Every service restarts automatically, and the engine resumes market lifecycles from PostgreSQL.
 
+## End-game 0.99 maker dry run (BTC, ETH, SOL, DOGE)
+
+Paper only, with live trading disabled. It runs one engine per asset against the same PostgreSQL: the existing `engine` service follows BTC, and `engine-eth`, `engine-sol` and `engine-doge` come with the compose profile `endgame`.
+
+**The rule:**
+- When the real-Chainlink TWAP model gives one side at least 0.95, post a post-only (maker) bid at 0.99 for 10 shares.
+- Keep its place in the queue.
+- Pull it only if that side drops below 0.80 before it fills.
+- After the window ends, keep it if our side won, pull it if it lost, or join the winner late.
+- Hold fills to settlement. There is no stop-loss.
+
+**Paper fills are honest:**
+- The bid waits behind the size already bid at 0.99 when it goes live.
+- It fills only from real taker sells at 0.99 recorded after that.
+
+1. **Settings in `.env.stockholm`.** Everything else as in the main setup; `POLY_API_*` is required for Chainlink:
+   ```
+   TRADING_MODE=paper
+   PAPER_TRADING_ENABLED=true
+   STRATEGY=endgame
+   # optional, defaults shown:
+   # ENDGAME_PRICE=0.99  ENDGAME_SHARES=10  ENDGAME_JOIN_S=300  ENDGAME_JOIN_PROB=0.95
+   # ENDGAME_CANCEL_PROB=0.80  ENDGAME_GRACE_S=90
+   ```
+   The env file stays written for BTC. The extra services set `ASSET`, the series, the exchange symbols and the feeds themselves.
+2. **Start all four:** `docker compose --env-file .env.stockholm --profile endgame up -d`
+   - The deploy scripts start only the default services. Run this once after `scripts/deploy.sh`.
+3. **Predictions are not needed.** The end-game rule reads the Chainlink TWAP features directly. Older models (feature version 2) no longer load, so the dashboard shows "no approved model" until one is approved from the PC with `python -m polygemy.research baseline --kind twap --approve`, over the SSH tunnel's `DATABASE_URL`.
+4. **Wait out the warm-up.** Bids start about 20 minutes after an engine (re)start; until then snapshots are degraded and nothing is posted.
+5. **Daily report** (bids, fills, fill rate, wins, losses, profit per asset and phase):
+   ```sh
+   docker compose --env-file .env.stockholm exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v hours=24 -f -' < scripts/endgame_report.sql
+   ```
+   - **A single loss in the "after end" phase means stop and investigate.**
+   - Overall, the win rate must stay above 99%, because one loss costs about 99 wins. That needs 300+ fills (several days) before any conclusion.
+
+**Resources:**
+- Each engine is about 50 MB of RAM (512 MB limit).
+- Raw data grows roughly ×4, still with 24 h retention.
+- Check that `DB_SIZE_BUDGET_GB` and the volume leave room.
+- Feed health rows of the other assets carry a suffix (`binance_eth`, `polymarket_sol`, …).
+
 ## Releases, deploys and rollback
 
 - **CI** (`.github/workflows/ci.yml`) runs on every push and PR: format, clippy (default and `--features live`), migrations twice, Rust/Python/dashboard tests, dependency audits and docker builds.

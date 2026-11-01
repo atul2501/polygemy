@@ -203,16 +203,19 @@ pub async fn load_records(pool: &PgPool, from_us: i64, to_us: i64) -> Result<Vec
     Ok(out)
 }
 
-/// Validated markets whose window overlaps [from, to).
+/// Validated markets of this instance's asset whose window overlaps [from, to).
 pub async fn markets(pool: &PgPool, from_us: i64, to_us: i64) -> Result<Vec<MarketCtx>> {
     let rows: Vec<MarketRow> = sqlx::query_as(
         "SELECT m.condition_id, m.window_start, m.window_end, m.methodology,
                 (SELECT token_id FROM market_tokens t WHERE t.condition_id = m.condition_id AND outcome = 'Up'),
                 (SELECT token_id FROM market_tokens t WHERE t.condition_id = m.condition_id AND outcome = 'Down')
-         FROM markets m WHERE m.validation_status = 'valid' AND m.window_end > $1 AND m.window_start < $2",
+         FROM markets m WHERE m.validation_status = 'valid' AND m.window_end > $1 AND m.window_start < $2
+           AND m.methodology IN ($3, $4)",
     )
     .bind(to_datetime(from_us))
     .bind(to_datetime(to_us))
+    .bind(crate::market::validate::Methodology::ChainlinkTwap60.name())
+    .bind(crate::market::validate::Methodology::ChainlinkSpot.name())
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -223,7 +226,7 @@ pub async fn markets(pool: &PgPool, from_us: i64, to_us: i64) -> Result<Vec<Mark
             end_us: e.timestamp_micros(),
             up_token: up,
             down_token: down,
-            twap: meth.as_deref() == Some("chainlink_btcusd_twap60"),
+            twap: meth == Some(crate::market::validate::Methodology::ChainlinkTwap60.name()),
         })
         .collect())
 }

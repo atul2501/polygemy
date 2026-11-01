@@ -4,7 +4,11 @@
 //! `SimExecutor` is deliberately conservative: an order is matched only against the first book
 //! snapshot at least `latency_us` after submission (never the book it was decided on), as
 //! fill-and-kill: it takes displayed liquidity up to the limit price and cancels the rest. There
-//! are no passive fills, so queue position never needs guessing.
+//! are no passive fills in that path, so queue position never needs guessing.
+//!
+//! The end-game strategy is the exception: its post-only bids rest in the book. They join the
+//! back of the queue at the size displayed at their price when they go live, and fill only from
+//! taker sells at that price recorded after that moment (never from cancellations ahead of us).
 
 use std::collections::HashMap;
 
@@ -16,7 +20,10 @@ use crate::features::FeatureEngine;
 use crate::persist::{FeatureRow, PredictionRow};
 use crate::positions::{Book as Positions, Entry, FillSide};
 use crate::risk::{Context, OrderIntent, RiskEngine, RiskLimits, Verdict};
-use crate::strategy::{decide, fee, Action, Book, Decision, Inputs, Outcome, StrategyConfig};
+use crate::strategy::{
+    decide, endgame_decide, fee, Action, Book, Decision, EndgameConfig, EndgameInputs, EndgameStep,
+    Inputs, Outcome, StrategyConfig,
+};
 
 /// Positions of the book levels and context features inside a feature row.
 #[derive(Debug, Clone)]
@@ -25,6 +32,10 @@ pub struct FeatureIndex {
     time_remaining: usize,
     twap_age: usize,
     book_age: usize,
+    price_to_beat: usize,
+    p_twap: usize,
+    twap_final: usize,
+    sold99: [usize; 2],
 }
 
 impl Default for FeatureIndex {
@@ -53,6 +64,10 @@ impl Default for FeatureIndex {
             time_remaining: pos("time_remaining_s"),
             twap_age: pos("cl_twap_age_ms"),
             book_age: pos("poly_book_age_ms"),
+            price_to_beat: pos("price_to_beat"),
+            p_twap: pos("p_twap_settle"),
+            twap_final: pos("twap_final"),
+            sold99: [pos("up_sold99_cum"), pos("down_sold99_cum")],
         }
     }
 }
@@ -64,6 +79,9 @@ fn dec(x: f64, dp: u32) -> Option<Decimal> {
 }
 
 impl FeatureIndex {
+    fn get(&self, f: &[f64], i: usize) -> f64 {
+        f[i]
+    }
     /// (Up book, Down book) from a row; prices to 4 dp, sizes to 2 dp (exact for Polymarket ticks).
     pub fn books(&self, f: &[f64]) -> (Book, Book) {
         let side = |t: usize, px: usize, sz: usize| -> Vec<(Decimal, Decimal)> {
@@ -139,9 +157,19 @@ struct Pending {
     submit_us: i64,
 }
 
+/// A resting post-only bid (end-game).
+struct Resting {
+    intent: OrderIntent,
+    submit_us: i64,
+    /// (shares queued ahead at our price, taker volume sold at our price so far) when it went live.
+    live: Option<(Decimal, Decimal)>,
+    filled: Decimal,
+}
+
 pub struct SimExecutor {
     cfg: SimConfig,
     pending: Vec<Pending>,
+    resting: Vec<Resting>,
     rng: u64,
 }
 
@@ -151,6 +179,7 @@ impl SimExecutor {
         SimExecutor {
             cfg,
             pending: Vec::new(),
+            resting: Vec::new(),
             rng,
         }
     }
@@ -263,7 +292,121 @@ impl SimExecutor {
     }
 
     pub fn open_orders(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.resting.len()
+    }
+
+    /// Accepts a post-only bid that rests until filled or cancelled.
+    pub fn submit_resting(&mut self, intent: OrderIntent, now_us: i64) -> OrderUpdate {
+        let u = self.submit(intent, now_us);
+        if u.status == "acked" {
+            let p = self.pending.pop().expect("just submitted");
+            self.resting.push(Resting {
+                intent: p.intent,
+                submit_us: p.submit_us,
+                live: None,
+                filled: Decimal::ZERO,
+            });
+        }
+        u
+    }
+
+    /// Side and filled shares of the market's resting bid.
+    pub fn resting(&self, condition_id: &str) -> Option<(Outcome, Decimal)> {
+        self.resting
+            .iter()
+            .find(|r| r.intent.condition_id == condition_id)
+            .map(|r| (r.intent.outcome, r.filled))
+    }
+
+    /// Advances the market's resting bids with this row's book and cumulative 0.99 sells per side.
+    pub fn on_queue(
+        &mut self,
+        condition_id: &str,
+        up: &Book,
+        down: &Book,
+        sold: [Decimal; 2],
+        now_us: i64,
+    ) -> (Vec<SimFill>, Vec<OrderUpdate>) {
+        let (mut fills, mut updates) = (Vec::new(), Vec::new());
+        let latency = self.cfg.latency_us;
+        self.resting.retain_mut(|r| {
+            if r.intent.condition_id != condition_id || now_us < r.submit_us + latency {
+                return true;
+            }
+            let (book, sold) = if r.intent.outcome == Outcome::Up {
+                (up, sold[0])
+            } else {
+                (down, sold[1])
+            };
+            let Some((ahead, base)) = r.live else {
+                // Goes live now: behind every share already bid at our price or better.
+                let ahead = book
+                    .bids
+                    .iter()
+                    .filter(|(px, _)| *px >= r.intent.limit_price)
+                    .map(|l| l.1)
+                    .sum();
+                r.live = Some((ahead, sold));
+                return true;
+            };
+            let total = (sold - base - ahead)
+                .max(Decimal::ZERO)
+                .min(r.intent.shares);
+            if total > r.filled {
+                let n = total - r.filled;
+                fills.push(SimFill {
+                    client_order_id: r.intent.client_order_id.clone(),
+                    // Unique per fill: shares filled before this one.
+                    fill_id: format!("{}#{}", r.intent.client_order_id, r.filled),
+                    ts_us: now_us,
+                    shares: n,
+                    price: r.intent.limit_price,
+                    fee: Decimal::ZERO,
+                });
+                r.filled = total;
+                let done = r.filled >= r.intent.shares;
+                updates.push(OrderUpdate {
+                    client_order_id: r.intent.client_order_id.clone(),
+                    status: if done { "filled" } else { "partially_filled" },
+                    filled_shares: r.filled,
+                    avg_price: Some(r.intent.limit_price),
+                    fee: Decimal::ZERO,
+                    ts_us: now_us,
+                    error: None,
+                });
+                return !done;
+            }
+            true
+        });
+        (fills, updates)
+    }
+
+    /// Pulls the market's resting bid (status `cancelled` or `expired`).
+    pub fn cancel(
+        &mut self,
+        condition_id: &str,
+        now_us: i64,
+        status: &'static str,
+        reason: String,
+    ) -> Option<OrderUpdate> {
+        let i = self
+            .resting
+            .iter()
+            .position(|r| r.intent.condition_id == condition_id)?;
+        let r = self.resting.remove(i);
+        let queue = r
+            .live
+            .map(|(a, _)| format!("; {a} shares were ahead at go-live"))
+            .unwrap_or_default();
+        Some(OrderUpdate {
+            client_order_id: r.intent.client_order_id,
+            status,
+            filled_shares: r.filled,
+            avg_price: (!r.filled.is_zero()).then_some(r.intent.limit_price),
+            fee: Decimal::ZERO,
+            ts_us: now_us,
+            error: Some(format!("{reason}{queue}")),
+        })
     }
 }
 
@@ -326,6 +469,8 @@ pub struct Trader {
     /// Approved entries per market (the strategy limits re-entries).
     entries: HashMap<String, u32>,
     fee_rates: HashMap<String, Decimal>,
+    /// End-game 0.99 maker instead of the probability strategy: config and grace seconds.
+    pub endgame: Option<(EndgameConfig, f64)>,
 }
 
 const QUIET_EVERY_US: i64 = 10_000_000;
@@ -349,6 +494,7 @@ impl Trader {
             quiet: HashMap::new(),
             entries: HashMap::new(),
             fee_rates: HashMap::new(),
+            endgame: None,
         }
     }
 
@@ -421,10 +567,17 @@ impl Trader {
         env: &Env,
         order_meta: &mut HashMap<String, (String, Outcome, FillSide)>,
     ) -> Vec<TradeRecord> {
+        if self.endgame.is_some() {
+            return self.on_row_endgame(row, env, order_meta);
+        }
         let mut out = Vec::new();
         let (up, down) = self.idx.books(&row.features);
         let (fills, updates) = self.exec.on_books(&row.condition_id, &up, &down, row.ts_us);
         self.apply_fills(fills, updates, order_meta, &mut out);
+        if self.idx.time_remaining(&row.features) <= 0.0 {
+            // After the window (end-game grace rows): only finish what is pending.
+            return out;
+        }
 
         let fee_rate = self
             .fee_rates
@@ -572,6 +725,154 @@ impl Trader {
                     ts_us: row.ts_us,
                     decision: d,
                 });
+            }
+        }
+        out
+    }
+
+    /// End-game step: advance the resting bid, then join / keep / pull it per `endgame_decide`.
+    fn on_row_endgame(
+        &mut self,
+        row: &FeatureRow,
+        env: &Env,
+        order_meta: &mut HashMap<String, (String, Outcome, FillSide)>,
+    ) -> Vec<TradeRecord> {
+        let (cfg, grace_s) = self.endgame.clone().expect("end-game mode");
+        let mut out = Vec::new();
+        let f = &row.features;
+        let cid = &row.condition_id;
+        let (up, down) = self.idx.books(f);
+        let sold = self
+            .idx
+            .sold99
+            .map(|i| dec(self.idx.get(f, i), 2).unwrap_or_default());
+        let (fills, updates) = self.exec.on_queue(cid, &up, &down, sold, row.ts_us);
+        self.apply_fills(fills, updates, order_meta, &mut out);
+        let t = self.idx.time_remaining(f);
+        if t <= 1.0 - grace_s {
+            // Last row of the grace period: an unfilled bid expires.
+            if let Some(u) = self
+                .exec
+                .cancel(cid, row.ts_us, "expired", "grace period over".into())
+            {
+                self.apply_fills(Vec::new(), vec![u], order_meta, &mut out);
+            }
+            return out;
+        }
+        let held = self
+            .positions
+            .get(cid)
+            .map(|p| p.shares)
+            .unwrap_or_default();
+        let inputs = EndgameInputs {
+            condition_id: cid,
+            time_remaining_s: t,
+            price_to_beat: self.idx.get(f, self.idx.price_to_beat),
+            p_up: self.idx.get(f, self.idx.p_twap),
+            twap_final: self.idx.get(f, self.idx.twap_final),
+            up: &up,
+            down: &down,
+            resting: self.exec.resting(cid).map(|r| r.0),
+            held,
+            data_ok: !row.degraded && env.feeds_ok,
+        };
+        let sid = self.signal_id(cid, row.ts_us);
+        let note = |action: Action, why: String| {
+            let mut d = Decision::note(cid, action, why);
+            d.model_version = "endgame".into();
+            d
+        };
+        match endgame_decide(&cfg, &inputs) {
+            EndgameStep::Join(d) => {
+                let ctx = Context {
+                    now_us: row.ts_us,
+                    kill_switch: env.kill_switch,
+                    feeds_ok: env.feeds_ok && !row.degraded,
+                    // The decision rests on the Chainlink TWAP, not on a model.
+                    model_ok: true,
+                    data_age_ms: self.idx.data_age_ms(f),
+                    // A resting bid is priced by us, not by the book.
+                    best_price: Some(cfg.price),
+                    positions: &self.positions,
+                    realized_total: self.positions.realized_total() - self.positions.fees_total(),
+                    unrealized_total: Decimal::ZERO,
+                };
+                let verdict = self.risk.check(&d, &ctx);
+                out.push(TradeRecord::Signal {
+                    id: sid.clone(),
+                    ts_us: row.ts_us,
+                    decision: *d,
+                });
+                match verdict {
+                    Verdict::Approved(mut intent) => {
+                        intent.time_in_force = "POST_ONLY";
+                        out.push(TradeRecord::Risk {
+                            ts_us: row.ts_us,
+                            condition_id: cid.clone(),
+                            signal_id: sid.clone(),
+                            rule: "approved",
+                            approved: true,
+                            detail: format!(
+                                "post-only bid {} @ {}",
+                                intent.shares, intent.limit_price
+                            ),
+                        });
+                        order_meta.insert(
+                            intent.client_order_id.clone(),
+                            (cid.clone(), intent.outcome, intent.side),
+                        );
+                        out.push(TradeRecord::Order {
+                            intent: intent.clone(),
+                            token_id: None,
+                            signal_id: sid,
+                            ts_us: row.ts_us,
+                        });
+                        let u = self.exec.submit_resting(intent, row.ts_us);
+                        if u.status == "rejected" {
+                            self.risk.on_execution(false);
+                        }
+                        out.push(TradeRecord::OrderUpdate(u));
+                    }
+                    Verdict::Rejected { rule, detail } => out.push(TradeRecord::Risk {
+                        ts_us: row.ts_us,
+                        condition_id: cid.clone(),
+                        signal_id: sid,
+                        rule,
+                        approved: false,
+                        detail,
+                    }),
+                }
+            }
+            EndgameStep::Cancel(why) => {
+                if let Some(u) = self.exec.cancel(cid, row.ts_us, "cancelled", why.clone()) {
+                    out.push(TradeRecord::Signal {
+                        id: sid,
+                        ts_us: row.ts_us,
+                        decision: note(Action::NoTrade, format!("cancel: {why}")),
+                    });
+                    self.apply_fills(Vec::new(), vec![u], order_meta, &mut out);
+                }
+            }
+            EndgameStep::Keep(why) | EndgameStep::Wait(why) => {
+                let action = if inputs.resting.is_some() || held > Decimal::ZERO {
+                    Action::Hold
+                } else {
+                    Action::NoTrade
+                };
+                let key = format!(
+                    "{}|{}",
+                    action.as_str(),
+                    why.split(':').next().unwrap_or_default()
+                );
+                let last = self.quiet.get(cid);
+                if last.is_none_or(|(k, t)| *k != key || row.ts_us - t >= QUIET_EVERY_US) {
+                    self.quiet.insert(cid.clone(), (key, row.ts_us));
+                    out.push(TradeRecord::Signal {
+                        id: sid,
+                        ts_us: row.ts_us,
+                        decision: note(action, why),
+                    });
+                }
             }
         }
         out

@@ -5,17 +5,18 @@ use super::discovery::MarketMeta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Methodology {
-    /// Chainlink BTC/USD 60-second TWAP data stream.
+    /// Chainlink 60-second TWAP data stream of the instance's asset.
     ChainlinkTwap60,
-    /// Chainlink BTC/USD spot data stream.
+    /// Chainlink spot data stream of the instance's asset.
     ChainlinkSpot,
 }
 
 impl Methodology {
-    pub fn as_str(self) -> &'static str {
+    /// Stored name, e.g. `chainlink_btcusd_twap60`.
+    pub fn name(self) -> String {
         match self {
-            Methodology::ChainlinkTwap60 => "chainlink_btcusd_twap60",
-            Methodology::ChainlinkSpot => "chainlink_btcusd_spot",
+            Methodology::ChainlinkTwap60 => format!("chainlink_{}", crate::asset::twap_feed()),
+            Methodology::ChainlinkSpot => format!("chainlink_{}_spot", crate::asset::spot_feed()),
         }
     }
 }
@@ -42,7 +43,7 @@ pub enum Validation {
 /// Reads the settlement rule from the market's own text. Unknown wording => None (never guessed).
 pub fn methodology(description: &str) -> Option<(Methodology, bool)> {
     let d = description.to_lowercase();
-    if !d.contains("chainlink") || !d.contains("btc/usd") {
+    if !d.contains("chainlink") || !d.contains(crate::asset::current().pair) {
         return None;
     }
     let tie_up = if d.contains("greater than or equal to") {

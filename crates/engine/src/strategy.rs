@@ -160,6 +160,25 @@ fn dec(x: f64) -> Decimal {
 }
 
 impl Decision {
+    /// A non-order decision (hold / no trade) carrying only its explanation.
+    pub fn note(condition_id: &str, action: Action, explanation: String) -> Decision {
+        let i = Inputs {
+            condition_id,
+            prediction_id: None,
+            model_version: "",
+            p_up: f64::NAN,
+            p_se: f64::NAN,
+            up: &Book::default(),
+            down: &Book::default(),
+            time_remaining_s: f64::NAN,
+            fee_rate: Decimal::ZERO,
+            held: None,
+            data_ok: false,
+            entries: 0,
+        };
+        Decision::base(&i, action, explanation)
+    }
+
     fn base(i: &Inputs, action: Action, explanation: String) -> Decision {
         Decision {
             action,
@@ -400,6 +419,221 @@ pub fn decide(cfg: &StrategyConfig, i: &Inputs) -> Decision {
     best.unwrap_or_else(|| Decision::base(i, Action::NoTrade, reasons.join("; ")))
 }
 
+// ---- End-game 0.99 maker ---------------------------------------------------------------------
+// Buy the side that is about to win (or has won) with a resting post-only bid at 0.99: no fee,
+// 1 cent per share if it wins, the whole stake if it loses. The 0.99 queue is first come first
+// served, so the bid joins early, keeps its place, is pulled only on a real reversal before it
+// fills, and a fill is held to settlement (no stop-loss: these markets dip and recover).
+
+#[derive(Debug, Clone)]
+pub struct EndgameConfig {
+    /// Bid price (maker only).
+    pub price: Decimal,
+    pub shares: Decimal,
+    /// Join no earlier than this many seconds before the end.
+    pub join_s: f64,
+    /// Join when the real-Chainlink TWAP model gives a side at least this probability.
+    pub join_prob: f64,
+    /// Pull an unfilled bid when its side drops below this probability.
+    pub cancel_prob: f64,
+    /// After the end: |final - price to beat| / price to beat below this is too close to call.
+    pub min_final_gap: f64,
+}
+
+impl Default for EndgameConfig {
+    fn default() -> Self {
+        EndgameConfig {
+            price: Decimal::new(99, 2),
+            shares: Decimal::from(10),
+            join_s: 300.0,
+            join_prob: 0.95,
+            cancel_prob: 0.80,
+            min_final_gap: 1e-4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EndgameInputs<'a> {
+    pub condition_id: &'a str,
+    /// Seconds to the window end; <= 0 after it.
+    pub time_remaining_s: f64,
+    pub price_to_beat: f64,
+    /// Settlement probability of Up from the real Chainlink TWAP model (p_twap_settle).
+    pub p_up: f64,
+    /// The TWAP report at the window end, once it has arrived (NaN before).
+    pub twap_final: f64,
+    pub up: &'a Book,
+    pub down: &'a Book,
+    /// Side of our resting bid, if one is live.
+    pub resting: Option<Outcome>,
+    /// Shares already bought in this market.
+    pub held: Decimal,
+    pub data_ok: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum EndgameStep {
+    /// Post a resting bid (the decision goes through the risk engine).
+    Join(Box<Decision>),
+    /// Pull the resting bid.
+    Cancel(String),
+    /// Keep the resting bid where it is in the queue.
+    Keep(String),
+    /// Nothing to do.
+    Wait(String),
+}
+
+fn side_p(p_up: f64, o: Outcome) -> f64 {
+    if o == Outcome::Up {
+        p_up
+    } else {
+        1.0 - p_up
+    }
+}
+
+fn endgame_join(
+    cfg: &EndgameConfig,
+    i: &EndgameInputs,
+    o: Outcome,
+    p: f64,
+    why: String,
+) -> EndgameStep {
+    let book = if o == Outcome::Up { i.up } else { i.down };
+    if book.best_ask().is_some_and(|a| a <= cfg.price) {
+        // A post-only bid at or above the best ask would cross; we never take.
+        return EndgameStep::Wait(format!(
+            "{} ask {} at or below {}: post-only would cross",
+            o.as_str(),
+            book.best_ask().unwrap_or_default(),
+            cfg.price
+        ));
+    }
+    let shares = cfg.shares - i.held;
+    let pd = dec(p);
+    EndgameStep::Join(Box::new(Decision {
+        action: if o == Outcome::Up {
+            Action::BuyUp
+        } else {
+            Action::BuyDown
+        },
+        condition_id: i.condition_id.to_string(),
+        prediction_id: None,
+        model_version: "endgame".into(),
+        outcome: Some(o),
+        p_model: p,
+        p_market: f64::NAN,
+        fair_value: pd,
+        entry_price: cfg.price,
+        worst_price: cfg.price,
+        shares,
+        fee: Decimal::ZERO,
+        spread: Decimal::ZERO,
+        slippage: Decimal::ZERO,
+        exit_cost: Decimal::ZERO,
+        expected_exit_price: pd,
+        expected_net: (shares * (pd - cfg.price)).round_dp(6),
+        expected_return: if cfg.price > Decimal::ZERO {
+            ((pd - cfg.price) / cfg.price).round_dp(6)
+        } else {
+            Decimal::ZERO
+        },
+        risk_amount: (shares * cfg.price).round_dp(6),
+        explanation: why,
+    }))
+}
+
+pub fn endgame_decide(cfg: &EndgameConfig, i: &EndgameInputs) -> EndgameStep {
+    if i.held >= cfg.shares {
+        return EndgameStep::Wait("filled: holding to settlement".into());
+    }
+    let ended = i.time_remaining_s <= 0.0;
+    if ended && i.twap_final.is_finite() && i.price_to_beat > 0.0 {
+        let gap = (i.twap_final - i.price_to_beat) / i.price_to_beat;
+        if gap.abs() < cfg.min_final_gap {
+            return match i.resting {
+                Some(_) => EndgameStep::Cancel(format!(
+                    "final TWAP {:.6} too close to price to beat {:.6}",
+                    i.twap_final, i.price_to_beat
+                )),
+                None => EndgameStep::Wait("final too close to call".into()),
+            };
+        }
+        let winner = if gap >= 0.0 {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        };
+        return match i.resting {
+            Some(o) if o == winner => EndgameStep::Keep(format!(
+                "{} won: keeping our place in the queue",
+                o.as_str()
+            )),
+            Some(o) => EndgameStep::Cancel(format!("{} lost: pulling the bid", o.as_str())),
+            None if i.held > Decimal::ZERO => {
+                EndgameStep::Wait("partly filled: holding to settlement".into())
+            }
+            None if !i.data_ok => EndgameStep::Wait("decided, but data is stale".into()),
+            None => endgame_join(
+                cfg,
+                i,
+                winner,
+                1.0,
+                format!("decided after end: {} won", winner.as_str()),
+            ),
+        };
+    }
+    if let Some(o) = i.resting {
+        let p = side_p(i.p_up, o);
+        // Before the deciding report arrives, a resting bid only moves on a real reversal.
+        return if p.is_finite() && p < cfg.cancel_prob && !ended {
+            EndgameStep::Cancel(format!(
+                "reversal: {} at p={p:.3} below {}",
+                o.as_str(),
+                cfg.cancel_prob
+            ))
+        } else {
+            EndgameStep::Keep(format!("{} at p={p:.3}: keeping our place", o.as_str()))
+        };
+    }
+    if i.held > Decimal::ZERO {
+        // Partly filled and the rest pulled: hold what we have, never add the other side.
+        return EndgameStep::Wait("partly filled: holding to settlement".into());
+    }
+    if ended {
+        return EndgameStep::Wait("window ended: waiting for the deciding TWAP report".into());
+    }
+    if i.time_remaining_s > cfg.join_s {
+        return EndgameStep::Wait(format!(
+            "{:.0} s left: joins from {:.0} s",
+            i.time_remaining_s, cfg.join_s
+        ));
+    }
+    if !i.data_ok || !i.p_up.is_finite() {
+        return EndgameStep::Wait("data stale or no TWAP probability".into());
+    }
+    for o in [Outcome::Up, Outcome::Down] {
+        let p = side_p(i.p_up, o);
+        if p >= cfg.join_prob {
+            return endgame_join(
+                cfg,
+                i,
+                o,
+                p,
+                format!(
+                    "early join: {} at p={p:.3}, {:.0} s left",
+                    o.as_str(),
+                    i.time_remaining_s
+                ),
+            );
+        }
+    }
+    EndgameStep::Wait(format!(
+        "no side at p >= {} (Up p={:.3})",
+        cfg.join_prob, i.p_up
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +801,186 @@ mod tests {
         let x = decide(&StrategyConfig::default(), &inputs(0.55, &up, &down));
         assert_eq!(x.action, Action::BuyDown);
         assert_eq!(x.outcome, Some(Outcome::Down));
+    }
+
+    fn eg<'a>(
+        t: f64,
+        p_up: f64,
+        fin: f64,
+        up: &'a Book,
+        down: &'a Book,
+        resting: Option<Outcome>,
+        held: &str,
+    ) -> EndgameInputs<'a> {
+        EndgameInputs {
+            condition_id: "m",
+            time_remaining_s: t,
+            price_to_beat: 100.0,
+            p_up,
+            twap_final: fin,
+            up,
+            down,
+            resting,
+            held: d(held),
+            data_ok: true,
+        }
+    }
+
+    #[test]
+    fn endgame_joins_early_on_the_favoured_side_only_inside_the_window() {
+        let cfg = EndgameConfig {
+            join_s: 120.0,
+            ..EndgameConfig::default()
+        };
+        let (up, dn) = (
+            book(&[("0.97", "100")], &[("1.00", "50")]),
+            book(&[("0.01", "100")], &[("0.03", "50")]),
+        );
+        assert!(
+            matches!(
+                endgame_decide(&cfg, &eg(150.0, 0.99, f64::NAN, &up, &dn, None, "0")),
+                EndgameStep::Wait(_)
+            ),
+            "too early"
+        );
+        assert!(
+            matches!(
+                endgame_decide(&cfg, &eg(100.0, 0.90, f64::NAN, &up, &dn, None, "0")),
+                EndgameStep::Wait(_)
+            ),
+            "not favoured enough"
+        );
+        let EndgameStep::Join(x) =
+            endgame_decide(&cfg, &eg(100.0, 0.97, f64::NAN, &up, &dn, None, "0"))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (x.action, x.outcome, x.worst_price, x.shares, x.fee),
+            (
+                Action::BuyUp,
+                Some(Outcome::Up),
+                d("0.99"),
+                d("10"),
+                Decimal::ZERO
+            )
+        );
+        let EndgameStep::Join(x) =
+            endgame_decide(&cfg, &eg(100.0, 0.02, f64::NAN, &dn, &up, None, "0"))
+        else {
+            panic!()
+        };
+        assert_eq!(x.action, Action::BuyDown);
+        // Post-only never crosses: an ask at 0.99 means we would be taking.
+        let cheap = book(&[("0.98", "10")], &[("0.99", "10")]);
+        assert!(matches!(
+            endgame_decide(&cfg, &eg(100.0, 0.97, f64::NAN, &cheap, &dn, None, "0")),
+            EndgameStep::Wait(_)
+        ));
+        let mut stale = eg(100.0, 0.97, f64::NAN, &up, &dn, None, "0");
+        stale.data_ok = false;
+        assert!(matches!(endgame_decide(&cfg, &stale), EndgameStep::Wait(_)));
+    }
+
+    #[test]
+    fn endgame_keeps_its_place_and_pulls_only_on_a_reversal() {
+        let cfg = EndgameConfig::default();
+        let (up, dn) = (book(&[], &[("1.00", "1")]), book(&[], &[("1.00", "1")]));
+        // A dip to 0.85 is noise: keep the queue place.
+        assert!(matches!(
+            endgame_decide(
+                &cfg,
+                &eg(60.0, 0.85, f64::NAN, &up, &dn, Some(Outcome::Up), "0")
+            ),
+            EndgameStep::Keep(_)
+        ));
+        assert!(matches!(
+            endgame_decide(
+                &cfg,
+                &eg(60.0, 0.70, f64::NAN, &up, &dn, Some(Outcome::Up), "0")
+            ),
+            EndgameStep::Cancel(_)
+        ));
+        assert!(matches!(
+            endgame_decide(
+                &cfg,
+                &eg(60.0, 0.10, f64::NAN, &up, &dn, Some(Outcome::Down), "0")
+            ),
+            EndgameStep::Keep(_)
+        ));
+        // After the end, before the deciding report: keep.
+        assert!(matches!(
+            endgame_decide(
+                &cfg,
+                &eg(-1.0, f64::NAN, f64::NAN, &up, &dn, Some(Outcome::Up), "0")
+            ),
+            EndgameStep::Keep(_)
+        ));
+        // Filled: hold to settlement, nothing else (no stop-loss, no second side).
+        assert!(matches!(
+            endgame_decide(&cfg, &eg(60.0, 0.10, f64::NAN, &up, &dn, None, "10")),
+            EndgameStep::Wait(_)
+        ));
+        assert!(
+            matches!(
+                endgame_decide(&cfg, &eg(60.0, 0.99, f64::NAN, &up, &dn, None, "4")),
+                EndgameStep::Wait(_)
+            ),
+            "partly filled: no re-join"
+        );
+    }
+
+    #[test]
+    fn endgame_after_the_end_follows_the_final_twap() {
+        let cfg = EndgameConfig::default();
+        let (up, dn) = (book(&[], &[("1.00", "1")]), book(&[], &[("1.00", "1")]));
+        assert!(matches!(
+            endgame_decide(
+                &cfg,
+                &eg(-2.0, f64::NAN, 100.05, &up, &dn, Some(Outcome::Up), "0")
+            ),
+            EndgameStep::Keep(_)
+        ));
+        assert!(
+            matches!(
+                endgame_decide(
+                    &cfg,
+                    &eg(-2.0, f64::NAN, 99.95, &up, &dn, Some(Outcome::Up), "0")
+                ),
+                EndgameStep::Cancel(_)
+            ),
+            "our side lost"
+        );
+        assert!(
+            matches!(
+                endgame_decide(
+                    &cfg,
+                    &eg(-2.0, f64::NAN, 100.005, &up, &dn, Some(Outcome::Up), "0")
+                ),
+                EndgameStep::Cancel(_)
+            ),
+            "too close to call"
+        );
+        let EndgameStep::Join(x) =
+            endgame_decide(&cfg, &eg(-2.0, f64::NAN, 99.9, &up, &dn, None, "0"))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (x.action, x.p_model),
+            (Action::BuyDown, 1.0),
+            "late join on the decided winner"
+        );
+        // A tie resolves Up.
+        let EndgameStep::Join(x) = endgame_decide(
+            &EndgameConfig {
+                min_final_gap: 0.0,
+                ..cfg
+            },
+            &eg(-2.0, f64::NAN, 100.0, &up, &dn, None, "0"),
+        ) else {
+            panic!()
+        };
+        assert_eq!(x.action, Action::BuyUp);
     }
 }

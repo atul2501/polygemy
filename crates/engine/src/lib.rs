@@ -1,3 +1,4 @@
+pub mod asset;
 pub mod backtest;
 pub mod bench;
 pub mod book;

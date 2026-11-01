@@ -114,7 +114,14 @@ impl Pipeline {
             let t = now_us();
             self.health
                 .on_message(t, None, t + compute_us, !row.degraded);
-            let preds = self.predictor.predict(&row, data_age_ms(&row));
+            // Rows after a window ends (end-game grace) are for the trader only: not predicted,
+            // not stored, so datasets and calibration only ever see the window itself.
+            let in_window = row.features[0] > 0.0;
+            let preds = if in_window {
+                self.predictor.predict(&row, data_age_ms(&row))
+            } else {
+                Vec::new()
+            };
             if let Some(pt) = self.trader.as_mut() {
                 let env = Env {
                     kill_switch: pt.kill_switch,
@@ -137,7 +144,9 @@ impl Pipeline {
             for p in preds {
                 self.sink.send(Record::Prediction(p), &self.health);
             }
-            self.sink.send(Record::Features(row), &self.health);
+            if in_window {
+                self.sink.send(Record::Features(row), &self.health);
+            }
         }
     }
 

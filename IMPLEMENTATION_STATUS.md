@@ -115,6 +115,26 @@ Plan: Phases 3 → 4 → 6 → 5 → 7 → 8 → 9 (simulation before execution,
   - The model is not overconfident: widening its sd makes Brier worse in every bucket. The market simply has information the model lacks, most likely faster exchange prices (Chainlink arrives ~1.2 s late).
 - **Decision (per the plan's rule):** not eligible for paper trading. Next candidates: nowcasting Chainlink from Binance/Coinbase, and a model trained with the market price as an input, both judged against the market.
 
+## Historical research and the end-game 0.99 maker (31 Oct – 1 Nov 2026, branch `endgame-maker`)
+
+**Model strategies: no edge.** Tested on 4,000 historical BTC 5-minute and 2,900 BTC 15-minute markets from public data (`polygemy.research history-*`), with logistic, LightGBM, XGBoost and CatBoost:
+- No model beats the market on unseen markets.
+- Taker and maker backtests lose or break even once trade timing is corrected. Live traders see a trade ~2.1 s before the data-api timestamp.
+- Favourites are priced fairly: the edge at 0.93–0.97 is ≤ 0.3¢ per share.
+
+**What works for others:** ranking 14,500 wallets by real profit (`polygemy.research wallets-*`), the most consistent ones post **maker bids at 0.99 on the side that has (nearly) won**. In 1,595 BTC markets, buys at 0.99 after the window ended won 839 of 839.
+
+**Implemented (paper only):**
+- `STRATEGY=endgame`: join early on the real-Chainlink TWAP probability, keep the queue place, pull only on reversal, decide after the end from the deciding TWAP report, hold to settlement with no stop-loss.
+- Paper fills come from a queue model: queue-ahead from the live book, fills only from real taker sells at 0.99.
+- `ASSET=btc|eth|sol|doge` runs one engine per asset.
+- Feature version 3 adds `twap_final`, `up_sold99_cum` and `down_sold99_cum`; rows continue during a grace period after each window but are not stored or predicted.
+
+**Unproven:**
+- **Needs > 99% wins and 300+ fills.**
+- The expected profit is small: about $0.10 per 10-share fill.
+- See docs/DEPLOYMENT.md "End-game 0.99 maker dry run" and `scripts/endgame_report.sql`.
+
 ## Data collection
 
 Continuous paper-mode collection on the local PC started 31 Oct 2026 ~07:40 UTC (`make up`). Only runs while the PC is on; Polymarket hosts reset intermittently on this network.

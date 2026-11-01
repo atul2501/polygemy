@@ -20,7 +20,8 @@ use indicators::{norm_cdf, Bar, Indicators, Ring};
 
 /// Bump whenever a feature's meaning or the column order changes.
 /// v2: settlement TWAP model (twap_end_mean/sd, twap_window_observed, p_twap_settle, logit_p_twap).
-pub const FEATURE_VERSION: i16 = 2;
+/// v3: end-game inputs (twap_final, up_sold99_cum, down_sold99_cum).
+pub const FEATURE_VERSION: i16 = 3;
 const SECOND: i64 = 1_000_000;
 /// Indicator bars (seconds of arrival time).
 const BAR_US: i64 = 5 * SECOND;
@@ -200,7 +201,12 @@ struct PolyToken {
     book: Option<Levels>,
     last_trade: f64,
     trades: VecDeque<i64>,
+    /// Shares sold by takers at >= 0.99 (what a resting 0.99 bid could have bought).
+    sold99: f64,
 }
+
+/// Price at which taker sells are counted for the end-game bid queue.
+const SOLD_AT: f64 = 0.99 - 1e-9;
 
 #[derive(Debug, Default)]
 struct Deribit {
@@ -390,6 +396,8 @@ pub struct FeatureEngine {
     pub late_records: u64,
     warm_from_us: Option<i64>,
     warmup_us: i64,
+    /// Rows keep coming this long after a window ends (end-game strategy); 0 = window only.
+    grace_us: i64,
 }
 
 impl FeatureEngine {
@@ -414,7 +422,13 @@ impl FeatureEngine {
             late_records: 0,
             warm_from_us: None,
             warmup_us: WARMUP_US,
+            grace_us: 0,
         }
+    }
+
+    /// Keep emitting rows for `us` after each window ends (time_remaining_s <= 0 then).
+    pub fn set_end_grace(&mut self, us: i64) {
+        self.grace_us = us.max(0);
     }
 
     /// Ordered feature names of this version (computed from an empty state).
@@ -530,11 +544,13 @@ impl FeatureEngine {
             .get_or_insert_with(|| Ring::new(61))
             .push(self.deribit.oi);
 
-        self.markets.retain(|_, m| m.end_us > s - 60 * SECOND);
+        let grace = self.grace_us;
+        self.markets
+            .retain(|_, m| m.end_us + grace > s - 60 * SECOND);
         let active: Vec<MarketCtx> = self
             .markets
             .values()
-            .filter(|m| m.start_us <= s && s < m.end_us)
+            .filter(|m| m.start_us <= s && s < m.end_us + grace)
             .cloned()
             .collect();
         for m in active {
@@ -621,6 +637,9 @@ impl FeatureEngine {
                     (Kind::LastTrade, None) if e.source == Source::Polymarket => {
                         let t = self.poly.entry(e.symbol.clone()).or_default();
                         t.last_trade = f(e.price);
+                        if e.side == Some(Side::Sell) && t.last_trade >= SOLD_AT {
+                            t.sold99 += f(e.quantity);
+                        }
                         t.trades.push_back(e.received_us);
                         while t
                             .trades
@@ -657,10 +676,10 @@ impl FeatureEngine {
             }
             Record::Chainlink(c) => {
                 let v = f64::try_from(c.value).unwrap_or(f64::NAN);
-                match c.feed.as_str() {
-                    "btcusd" => self.cl_spot.add(c.observed_us, c.received_us, v),
-                    "btcusd_twap60" => self.cl_twap.add(c.observed_us, c.received_us, v),
-                    _ => {}
+                if c.feed == crate::asset::spot_feed() {
+                    self.cl_spot.add(c.observed_us, c.received_us, v);
+                } else if c.feed == crate::asset::twap_feed() {
+                    self.cl_twap.add(c.observed_us, c.received_us, v);
                 }
             }
             Record::Features(_) | Record::Prediction(_) => {}
@@ -1094,6 +1113,15 @@ impl FeatureEngine {
             "db_oi_chg_60s",
             oi.map(|r| r.back(0) / r.back(60) - 1.0).unwrap_or(f64::NAN),
         );
+
+        // ---- end-game (v3): the deciding TWAP report once it has arrived, and the 0.99 bid queue
+        f.put(
+            "twap_final",
+            stream.reference_at(m.end_us).unwrap_or(f64::NAN),
+        );
+        let sold = |t: &str| tok(t).map(|p| p.sold99).unwrap_or(0.0);
+        f.put("up_sold99_cum", sold(&m.up_token));
+        f.put("down_sold99_cum", sold(&m.down_token));
         f
     }
 }
@@ -1210,6 +1238,75 @@ mod tests {
         let mut e = FeatureEngine::new(syms(), "t".into());
         e.set_markets([market()]);
         records.iter().flat_map(|r| e.push(r.clone())).collect()
+    }
+
+    fn idx(n: &str) -> usize {
+        FeatureEngine::names().iter().position(|x| *x == n).unwrap()
+    }
+
+    fn poly_trade(us: i64, token: &str, px: &str, qty: &str, side: Side) -> Arc<Record> {
+        let mut e = MarketEvent::new(
+            Source::Polymarket,
+            Kind::LastTrade,
+            token,
+            us.to_string(),
+            us,
+        );
+        e.price = Some(px.parse().unwrap());
+        e.quantity = Some(qty.parse().unwrap());
+        e.side = Some(side);
+        Arc::new(Record::Event(e))
+    }
+
+    #[test]
+    fn end_grace_rows_carry_the_final_twap_once_it_arrives() {
+        let m = market();
+        let mut e = FeatureEngine::new(syms(), "t".into());
+        e.set_markets([m.clone()]);
+        e.set_end_grace(30 * SECOND);
+        let rows: Vec<FeatureRow> = stream().iter().flat_map(|r| e.push(r.clone())).collect();
+        let last = rows.iter().map(|r| r.ts_us).max().unwrap();
+        assert_eq!(
+            last,
+            m.end_us + 29 * SECOND,
+            "rows continue through the grace period"
+        );
+        let (t, f) = (idx("time_remaining_s"), idx("twap_final"));
+        for r in &rows {
+            if r.ts_us <= m.end_us + SECOND {
+                assert!(
+                    r.features[f].is_nan(),
+                    "no final TWAP before its report arrived"
+                );
+            }
+        }
+        let after: Vec<_> = rows.iter().filter(|r| r.features[t] <= 0.0).collect();
+        assert!(!after.is_empty());
+        // The report observed at end + 0.1 s (from the second-311 tick) arrives at end + 1.31 s.
+        let expect = 77_000.0 + (311f64 * 0.3).sin() * 20.0 + 31.1 - 2.0;
+        let v = after.last().unwrap().features[f];
+        assert!(
+            (v - (expect * 100.0).round() / 100.0).abs() < 0.011,
+            "{v} vs {expect}"
+        );
+        // Without grace the window ends at end_us, as before.
+        let plain = run(&stream());
+        assert!(plain.iter().all(|r| r.ts_us < m.end_us));
+    }
+
+    #[test]
+    fn sold99_counts_only_taker_sells_at_99_per_side() {
+        let mut v = stream_n(120);
+        let t = T0 + 60 * SECOND;
+        v.push(poly_trade(t, "up", "0.99", "5", Side::Sell));
+        v.push(poly_trade(t + 1, "up", "0.99", "7", Side::Buy)); // a buyer lifting asks: no bid filled
+        v.push(poly_trade(t + 2, "up", "0.98", "3", Side::Sell)); // below 0.99: our 0.99 bid would be gone already, but it is not 0.99 volume
+        v.push(poly_trade(t + 3, "dn", "0.99", "2", Side::Sell));
+        v.sort_by_key(|r| r.received_us());
+        let rows = run(&v);
+        let r = rows.last().unwrap();
+        assert_eq!(r.features[idx("up_sold99_cum")], 5.0);
+        assert_eq!(r.features[idx("down_sold99_cum")], 2.0);
     }
 
     #[test]

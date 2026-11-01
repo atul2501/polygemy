@@ -32,6 +32,8 @@ async fn main() {
         }
     };
     telemetry::init(cfg.log_format, &cfg.log_level);
+    // Validated by the config already; fixes the asset for every module of this process.
+    polygemy_engine::asset::set(&cfg.feeds.asset).expect("asset validated by the config");
     if let Err(e) = dispatch(&cmd, &cfg).await {
         error!(error = format!("{e:#}"), command = cmd, "fatal");
         std::process::exit(1);
@@ -214,7 +216,20 @@ async fn run(cfg: &Config) -> Result<()> {
     }
     let app_env = cfg.app_env.as_str();
     // Unique per process start; the execution lease (later phase) will be keyed on it.
-    let instance_id = format!("{app_env}-{}", uuid::Uuid::new_v4());
+    let asset = polygemy_engine::asset::current().code;
+    let instance_id = if asset == "btc" {
+        format!("{app_env}-{}", uuid::Uuid::new_v4())
+    } else {
+        format!("{app_env}-{asset}-{}", uuid::Uuid::new_v4())
+    };
+    // Health rows are keyed by feed name in a shared table: other assets get their own names.
+    let suffixed = |name: &'static str| -> &'static str {
+        if asset == "btc" {
+            name
+        } else {
+            Box::leak(format!("{name}_{asset}").into_boxed_str())
+        }
+    };
     let pool = db::connect(&cfg.database_url, cfg.db_max_connections).await?;
     db::ensure_schema_current(&pool).await?;
     persist::ensure_partitions(&pool).await?;
@@ -253,7 +268,7 @@ async fn run(cfg: &Config) -> Result<()> {
     let stale = Duration::from_millis(f.stale_after_ms);
     let health = |name: &'static str| {
         Arc::new(FeedHealth::new(
-            name,
+            suffixed(name),
             f.required.iter().any(|r| r == name),
             stale,
         ))
@@ -333,7 +348,7 @@ async fn run(cfg: &Config) -> Result<()> {
             // With no subscriptions the only traffic is the 10 s PONG, so connection liveness needs a
             // longer window; per-book freshness is checked where a decision is made.
             let h = Arc::new(FeedHealth::new(
-                "polymarket",
+                suffixed("polymarket"),
                 f.required.iter().any(|r| r == "polymarket"),
                 stale.max(Duration::from_secs(15)),
             ));
@@ -353,7 +368,10 @@ async fn run(cfg: &Config) -> Result<()> {
         let required: Vec<Arc<FeedHealth>> =
             healths.iter().filter(|h| h.required).cloned().collect();
         for r in &f.required {
-            if !required.iter().any(|h| h.name == r.as_str()) {
+            if !required
+                .iter()
+                .any(|h| h.name == r.as_str() || h.name == format!("{r}_{asset}"))
+            {
                 warn!(
                     feed = r,
                     "required feed is not running: no market can become READY"
@@ -361,7 +379,7 @@ async fn run(cfg: &Config) -> Result<()> {
             }
         }
         let discovery_health = Arc::new(FeedHealth::new(
-            "discovery",
+            suffixed("discovery"),
             false,
             Duration::from_secs(f.discovery_interval_secs * 3),
         ));
@@ -408,16 +426,21 @@ async fn run(cfg: &Config) -> Result<()> {
             feature_version = features::FEATURE_VERSION,
             "feature pipeline starting"
         );
+        let mut engine = features::FeatureEngine::new(
+            features::Symbols {
+                binance: f.binance_symbol.clone(),
+                coinbase: f.coinbase_product.clone(),
+                deribit: f.deribit_instrument.clone(),
+            },
+            instance_id.clone(),
+        );
+        if let Some((_, grace_s)) = &cfg.endgame {
+            // End-game bids live on after each window; those rows reach the trader only.
+            engine.set_end_grace((*grace_s * 1e6) as i64);
+        }
         let pipe = pipeline::Pipeline {
             pool: pool.clone(),
-            engine: features::FeatureEngine::new(
-                features::Symbols {
-                    binance: f.binance_symbol.clone(),
-                    coinbase: f.coinbase_product.clone(),
-                    deribit: f.deribit_instrument.clone(),
-                },
-                instance_id.clone(),
-            ),
+            engine,
             predictor: predict::Predictor::new(models, cfg.trading_mode.as_str()),
             sink: sink.clone(),
             health: fh.clone(),
@@ -433,14 +456,22 @@ async fn run(cfg: &Config) -> Result<()> {
                     String::new(),
                     rx,
                 )));
+                let mut limits = polygemy_engine::risk::RiskLimits::default();
+                if cfg.endgame.is_some() {
+                    // A 0.99 bid has a negative expected value by the model's own number until the
+                    // outcome is decided; the end-game rule, not min_edge, decides when to join.
+                    limits.min_edge = rust_decimal::Decimal::NEGATIVE_ONE;
+                }
+                let mut trader = polygemy_engine::trading::Trader::new(
+                    mode,
+                    String::new(),
+                    Default::default(),
+                    limits,
+                    Default::default(),
+                );
+                trader.endgame = cfg.endgame.clone();
                 pipeline::PaperTrading {
-                    trader: polygemy_engine::trading::Trader::new(
-                        mode,
-                        String::new(),
-                        Default::default(),
-                        Default::default(),
-                        Default::default(),
-                    ),
+                    trader,
                     required: required_for_trading.clone(),
                     records: tx,
                     kill_switch: true, // until first read from the database

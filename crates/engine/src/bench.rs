@@ -78,9 +78,9 @@ pub fn run(model_fixture: Option<&str>) -> Value {
                 reason: "periodic",
             })));
         }
-        for feed in ["btcusd", "btcusd_twap60"] {
+        for feed in [crate::asset::spot_feed(), crate::asset::twap_feed()] {
             records.push(Arc::new(Record::Chainlink(ChainlinkReport {
-                feed: feed.into(),
+                feed,
                 provider: "chainlink".into(),
                 observed_us: t - 1_200_000,
                 value: format!("{px:.8}").parse().unwrap(),

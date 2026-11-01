@@ -16,7 +16,7 @@ pub async fn upsert_market(pool: &PgPool, m: &MarketMeta, v: &Validation) -> Res
         Validation::Valid(x) => (
             "valid",
             json!([]),
-            Some(x.methodology.as_str()),
+            Some(x.methodology.name()),
             Some(x.tie_resolves_up),
         ),
         Validation::Pending(e) => ("pending", json!(e), None, None),
@@ -140,12 +140,14 @@ pub async fn transition(
     Ok(())
 }
 
-/// Non-terminal markets with their stored metadata, for restart recovery.
-pub async fn load_open(pool: &PgPool) -> Result<Vec<(MarketMeta, State)>> {
+/// Non-terminal markets of one series with their stored metadata, for restart recovery. Other
+/// series belong to other engine instances sharing the database.
+pub async fn load_open(pool: &PgPool, series_slug: &str) -> Result<Vec<(MarketMeta, State)>> {
     let rows: Vec<(String, Option<String>, serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT l.state, m.series_slug, m.raw_gamma, m.raw_clob FROM market_lifecycles l JOIN markets m USING (condition_id)
-         WHERE l.state NOT IN ('COMPLETED', 'INVALID')",
+         WHERE l.state NOT IN ('COMPLETED', 'INVALID') AND m.series_slug = $1",
     )
+    .bind(series_slug)
     .fetch_all(pool)
     .await?;
     let mut out = Vec::new();

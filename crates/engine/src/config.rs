@@ -63,12 +63,16 @@ pub struct Config {
     pub log_format: LogFormat,
     pub log_level: String,
     pub feeds: Feeds,
+    /// `STRATEGY=endgame`: the 0.99 maker strategy and its grace seconds after each window.
+    pub endgame: Option<(crate::strategy::EndgameConfig, f64)>,
 }
 
 /// Market-data sources, endpoints and lifecycle timings. Endpoints default to the official
 /// public URLs; override only with other officially supported endpoints.
 #[derive(Clone)]
 pub struct Feeds {
+    /// The asset this instance follows (`ASSET`, see `crate::asset`); the defaults below derive from it.
+    pub asset: String,
     /// Subset of: binance, coinbase, deribit, chainlink, polymarket.
     pub enabled: Vec<String>,
     /// Feed health names that must be usable before a market may become READY.
@@ -149,7 +153,19 @@ impl Feeds {
                 .with_context(|| format!("{k} must be a non-negative integer"))
         };
 
-        let enabled = list("FEEDS_ENABLED", &ALL_FEEDS.join(","));
+        let asset = crate::asset::find(&or("ASSET", "btc"))?;
+        let default_feeds: Vec<&str> = ALL_FEEDS
+            .iter()
+            .copied()
+            .filter(|f| *f != "deribit" || asset.deribit.is_some())
+            .collect();
+        let enabled = list("FEEDS_ENABLED", &default_feeds.join(","));
+        if enabled.iter().any(|f| f == "deribit")
+            && asset.deribit.is_none()
+            && get("DERIBIT_INSTRUMENT").is_none()
+        {
+            bail!("ASSET={} has no Deribit perpetual: remove deribit from FEEDS_ENABLED or set DERIBIT_INSTRUMENT", asset.code);
+        }
         if let Some(bad) = enabled.iter().find(|f| !ALL_FEEDS.contains(&f.as_str())) {
             bail!(
                 "FEEDS_ENABLED contains unknown feed {bad:?}; allowed: {}",
@@ -185,15 +201,16 @@ impl Feeds {
             bail!("ENTRY_CUTOFF_SECS must be smaller than MARKET_WINDOW_SECS");
         }
         Ok(Feeds {
+            asset: asset.code.to_string(),
             enabled,
             required,
             binance_ws_url: or("BINANCE_WS_URL", "wss://stream.binance.com:9443"),
             binance_rest_url: or("BINANCE_REST_URL", "https://api.binance.com"),
-            binance_symbol: or("BINANCE_SYMBOL", "BTCUSDT"),
+            binance_symbol: or("BINANCE_SYMBOL", asset.binance),
             coinbase_ws_url: or("COINBASE_WS_URL", "wss://advanced-trade-ws.coinbase.com"),
-            coinbase_product: or("COINBASE_PRODUCT", "BTC-USD"),
+            coinbase_product: or("COINBASE_PRODUCT", asset.coinbase),
             deribit_ws_url: or("DERIBIT_WS_URL", "wss://www.deribit.com/ws/api/v2"),
-            deribit_instrument: or("DERIBIT_INSTRUMENT", "BTC-PERPETUAL"),
+            deribit_instrument: or("DERIBIT_INSTRUMENT", asset.deribit.unwrap_or_default()),
             deribit_extra_tickers: list("DERIBIT_EXTRA_TICKERS", ""),
             polymarket_ws_url: or(
                 "POLYMARKET_WS_URL",
@@ -202,7 +219,7 @@ impl Feeds {
             polybolt_ws_url: or("POLYBOLT_WS_URL", "wss://ws-live-v2.polymarket.com/ws"),
             gamma_api_url: or("GAMMA_API_URL", "https://gamma-api.polymarket.com"),
             clob_api_url: or("CLOB_API_URL", "https://clob.polymarket.com"),
-            series_slug: or("POLY_SERIES_SLUG", "btc-up-or-down-5m"),
+            series_slug: or("POLY_SERIES_SLUG", &format!("{}-up-or-down-5m", asset.code)),
             poly_api,
             stale_after_ms: num("FEED_STALE_MS", "5000")?,
             window_secs,
@@ -235,6 +252,67 @@ fn pick<T: Copy>(key: &str, raw: &str, options: &[(&str, T)]) -> Result<T> {
 
 fn parse_bool(key: &str, raw: &str) -> Result<bool> {
     pick(key, raw, &[("true", true), ("false", false)])
+}
+
+fn num<T: std::str::FromStr>(key: &str, raw: &str) -> Result<T> {
+    raw.parse()
+        .ok()
+        .with_context(|| format!("{key}={raw:?} is not a number"))
+}
+
+/// End-game settings (`STRATEGY=endgame`), validated as a whole.
+fn endgame(
+    or: impl Fn(&str, &str) -> String,
+) -> Result<Option<(crate::strategy::EndgameConfig, f64)>> {
+    if !pick(
+        "STRATEGY",
+        &or("STRATEGY", "ev"),
+        &[("ev", false), ("endgame", true)],
+    )? {
+        return Ok(None);
+    }
+    let d = crate::strategy::EndgameConfig::default();
+    let c = crate::strategy::EndgameConfig {
+        price: num("ENDGAME_PRICE", &or("ENDGAME_PRICE", &d.price.to_string()))?,
+        shares: num(
+            "ENDGAME_SHARES",
+            &or("ENDGAME_SHARES", &d.shares.to_string()),
+        )?,
+        join_s: num(
+            "ENDGAME_JOIN_S",
+            &or("ENDGAME_JOIN_S", &d.join_s.to_string()),
+        )?,
+        join_prob: num(
+            "ENDGAME_JOIN_PROB",
+            &or("ENDGAME_JOIN_PROB", &d.join_prob.to_string()),
+        )?,
+        cancel_prob: num(
+            "ENDGAME_CANCEL_PROB",
+            &or("ENDGAME_CANCEL_PROB", &d.cancel_prob.to_string()),
+        )?,
+        min_final_gap: d.min_final_gap,
+    };
+    let grace: f64 = num("ENDGAME_GRACE_S", &or("ENDGAME_GRACE_S", "90"))?;
+    let tick = rust_decimal::Decimal::new(1, 2);
+    if c.price < tick
+        || c.price >= rust_decimal::Decimal::ONE
+        || (c.price / tick).fract() != rust_decimal::Decimal::ZERO
+    {
+        bail!("ENDGAME_PRICE must be a 0.01 tick between 0.01 and 0.99");
+    }
+    if c.shares < rust_decimal::Decimal::from(5) {
+        bail!("ENDGAME_SHARES must be at least 5 (Polymarket minimum order)");
+    }
+    if !(c.join_s > 0.0 && c.join_s <= 300.0) {
+        bail!("ENDGAME_JOIN_S must be in (0, 300]");
+    }
+    if !(0.0 < c.cancel_prob && c.cancel_prob < c.join_prob && c.join_prob < 1.0) {
+        bail!("need 0 < ENDGAME_CANCEL_PROB < ENDGAME_JOIN_PROB < 1");
+    }
+    if !(1.0..=300.0).contains(&grace) {
+        bail!("ENDGAME_GRACE_S must be in [1, 300]");
+    }
+    Ok(Some((c, grace)))
 }
 
 impl Config {
@@ -301,6 +379,7 @@ impl Config {
             )?,
             log_level: or("LOG_LEVEL", "info"),
             feeds: Feeds::from_lookup(&get)?,
+            endgame: endgame(or)?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -339,9 +418,12 @@ impl Config {
             "prediction_enabled": self.prediction_enabled,
             "risk_engine_enabled": self.risk_engine_enabled,
             "paper_trading_enabled": self.paper_trading_enabled,
+            "strategy": if self.endgame.is_some() { "endgame" } else { "ev" },
+            "endgame": self.endgame.as_ref().map(|(c, g)| json!({"price": c.price.to_string(), "shares": c.shares.to_string(), "join_s": c.join_s, "join_prob": c.join_prob, "cancel_prob": c.cancel_prob, "grace_s": g})),
             "feeds_enabled": self.feeds.enabled,
             "required_feeds": self.feeds.required,
             "polymarket_api_credentials": self.feeds.poly_api.is_some(),
+            "asset": self.feeds.asset,
             "series_slug": self.feeds.series_slug,
             "raw_retention_hours": self.feeds.raw_retention_hours,
             "store_book_deltas": self.feeds.store_book_deltas,
@@ -415,6 +497,72 @@ mod tests {
         assert!(cfg(&[("DATABASE_URL", "sqlite://x.db")]).is_err());
         assert!(cfg(&[("DB_MAX_CONNECTIONS", "0")]).is_err());
         assert!(cfg(&[("DATABASE_URL", "")]).is_err());
+    }
+
+    #[test]
+    fn asset_derives_series_and_symbols() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(
+            (
+                c.feeds.asset.as_str(),
+                c.feeds.series_slug.as_str(),
+                c.feeds.binance_symbol.as_str()
+            ),
+            ("btc", "btc-up-or-down-5m", "BTCUSDT")
+        );
+        let c = cfg(&[("ASSET", "sol")]).unwrap();
+        assert_eq!(
+            (
+                c.feeds.series_slug.as_str(),
+                c.feeds.binance_symbol.as_str(),
+                c.feeds.coinbase_product.as_str()
+            ),
+            ("sol-up-or-down-5m", "SOLUSDT", "SOL-USD")
+        );
+        assert!(!c.feeds.on("deribit"), "no SOL perpetual on Deribit");
+        let c = cfg(&[("ASSET", "eth")]).unwrap();
+        assert_eq!(
+            (c.feeds.deribit_instrument.as_str(), c.feeds.on("deribit")),
+            ("ETH-PERPETUAL", true)
+        );
+        assert!(cfg(&[("ASSET", "xrp")]).is_err());
+        assert!(cfg(&[("ASSET", "doge"), ("FEEDS_ENABLED", "deribit,polymarket")]).is_err());
+    }
+
+    #[test]
+    fn endgame_settings() {
+        assert!(
+            cfg(&[]).unwrap().endgame.is_none(),
+            "default strategy is ev"
+        );
+        let (c, g) = cfg(&[("STRATEGY", "endgame")]).unwrap().endgame.unwrap();
+        assert_eq!(
+            (c.price.to_string(), c.join_s, g),
+            ("0.99".to_string(), 300.0, 90.0)
+        );
+        let (c, _) = cfg(&[
+            ("STRATEGY", "endgame"),
+            ("ENDGAME_JOIN_S", "60"),
+            ("ENDGAME_PRICE", "0.98"),
+        ])
+        .unwrap()
+        .endgame
+        .unwrap();
+        assert_eq!((c.join_s, c.price.to_string()), (60.0, "0.98".to_string()));
+        for bad in [
+            ("STRATEGY", "both"),
+            ("ENDGAME_PRICE", "1.00"),
+            ("ENDGAME_PRICE", "0.995"),
+            ("ENDGAME_SHARES", "2"),
+            ("ENDGAME_JOIN_S", "0"),
+            ("ENDGAME_CANCEL_PROB", "0.97"),
+            ("ENDGAME_GRACE_S", "0"),
+            ("ENDGAME_JOIN_PROB", "x"),
+        ] {
+            let mut kv = vec![("STRATEGY", "endgame")];
+            kv.push(bad);
+            assert!(cfg(&kv).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

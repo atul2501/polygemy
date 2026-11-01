@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use polygemy_engine::features::{FeatureEngine, FEATURE_VERSION};
 use polygemy_engine::persist::{FeatureRow, PredictionRow};
 use polygemy_engine::risk::RiskLimits;
-use polygemy_engine::strategy::{Outcome, StrategyConfig};
+use polygemy_engine::strategy::{EndgameConfig, Outcome, StrategyConfig};
 use polygemy_engine::trading::{store, Env, SimConfig, TradeRecord, Trader};
 use rust_decimal::Decimal;
 
@@ -358,4 +358,262 @@ async fn records_persist_with_a_balanced_ledger() {
         -(filled * d("0.5")),
         "lost the whole stake on Down"
     );
+}
+
+// ---- End-game 0.99 maker ------------------------------------------------------------------
+
+fn endgame_trader(run: &str) -> Trader {
+    let limits = RiskLimits {
+        min_edge: Decimal::NEGATIVE_ONE,
+        ..Default::default()
+    };
+    let mut t = Trader::new(
+        "backtest",
+        run.into(),
+        StrategyConfig::default(),
+        limits,
+        SimConfig::default(),
+    );
+    t.endgame = Some((EndgameConfig::default(), 90.0));
+    t
+}
+
+/// A row for the end-game: Up bid queue of `ahead` at 0.99, cumulative 0.99 sells per side.
+fn eg_row(
+    cid: &str,
+    ts: i64,
+    t_rem: f64,
+    p_up: f64,
+    fin: f64,
+    ahead: f64,
+    sold: [f64; 2],
+) -> FeatureRow {
+    let mut r = row(cid, ts, 1.0, 50.0, 0.99);
+    let names = FeatureEngine::names();
+    let mut set = |n: &str, v: f64| r.features[names.iter().position(|x| *x == n).unwrap()] = v;
+    set("time_remaining_s", t_rem);
+    set("price_to_beat", 100.0);
+    set("p_twap_settle", p_up);
+    set("twap_final", fin);
+    set("up_bid_sz1", ahead);
+    set("down_ask_px1", 1.0);
+    set("up_sold99_cum", sold[0]);
+    set("down_sold99_cum", sold[1]);
+    r
+}
+
+fn updates(r: &[TradeRecord]) -> Vec<(&'static str, Decimal)> {
+    r.iter()
+        .filter_map(|x| match x {
+            TradeRecord::OrderUpdate(u) => Some((u.status, u.filled_shares)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn endgame_bid_fills_only_after_the_queue_ahead_is_sold_through() {
+    let mut t = endgame_trader("q");
+    let mut meta = HashMap::new();
+    let mut all = Vec::new();
+    // Joins 100 s before the end on Up at p 0.97; goes live 1 s later behind 30 shares.
+    for (i, (t_rem, sold)) in [
+        (100.0, 100.0),
+        (99.0, 100.0),
+        (98.0, 120.0),
+        (97.0, 135.0),
+        (96.0, 150.0),
+        (95.0, 400.0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        all.extend(t.on_row(
+            &eg_row(
+                "m",
+                T0 + i as i64 * S,
+                *t_rem,
+                0.97,
+                f64::NAN,
+                30.0,
+                [*sold, 0.0],
+            ),
+            None,
+            &ENV,
+            &mut meta,
+        ));
+    }
+    let orders: Vec<_> = all
+        .iter()
+        .filter_map(|x| match x {
+            TradeRecord::Order { intent, .. } => Some(intent),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(orders.len(), 1, "one bid, never re-posted");
+    assert_eq!(
+        (
+            orders[0].time_in_force,
+            orders[0].limit_price,
+            orders[0].shares
+        ),
+        ("POST_ONLY", d("0.99"), d("10"))
+    );
+    // 120 sold: 20 after go-live, all absorbed by the 30 ahead. 135: 5 for us. 150: the rest.
+    assert_eq!(
+        updates(&all),
+        vec![
+            ("acked", d("0")),
+            ("partially_filled", d("5")),
+            ("filled", d("10"))
+        ]
+    );
+    let fills: Vec<_> = all
+        .iter()
+        .filter_map(|x| match x {
+            TradeRecord::Fill(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        fills
+            .iter()
+            .all(|f| f.price == d("0.99") && f.fee.is_zero()),
+        "maker: no fee"
+    );
+    let p = t.positions.get("m").unwrap();
+    assert_eq!(
+        (p.outcome, p.shares, p.cost),
+        (Outcome::Up, d("10"), d("9.90"))
+    );
+    t.settle("m", Outcome::Up, T0 + 400 * S);
+    assert_eq!(
+        t.positions.realized_total(),
+        d("0.10"),
+        "1 cent per share, held to settlement"
+    );
+}
+
+#[test]
+fn endgame_pulls_an_unfilled_bid_on_reversal_and_after_a_loss_and_expires_after_grace() {
+    let mut t = endgame_trader("c");
+    let mut meta = HashMap::new();
+    let r1 = t.on_row(
+        &eg_row("a", T0, 100.0, 0.97, f64::NAN, 30.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    let r2 = t.on_row(
+        &eg_row("a", T0 + S, 99.0, 0.85, f64::NAN, 30.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    assert_eq!(updates(&r2), vec![], "a dip to 0.85 keeps the queue place");
+    let r3 = t.on_row(
+        &eg_row("a", T0 + 2 * S, 98.0, 0.70, f64::NAN, 30.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    assert_eq!(updates(&r1), vec![("acked", d("0"))]);
+    assert_eq!(
+        updates(&r3),
+        vec![("cancelled", d("0"))],
+        "reversal below 0.80 pulls it"
+    );
+    // After the end: the side we bid on lost.
+    t.on_row(
+        &eg_row("b", T0, 50.0, 0.97, f64::NAN, 0.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    let r = t.on_row(
+        &eg_row("b", T0 + 60 * S, -2.0, f64::NAN, 99.9, 0.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    assert_eq!(updates(&r)[0], ("cancelled", d("0")));
+    // Decided after the end with no bid: join the winner late; nobody sells, so it expires.
+    let r = t.on_row(
+        &eg_row("c", T0, -3.0, f64::NAN, 100.2, 0.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    assert_eq!(updates(&r), vec![("acked", d("0"))]);
+    let r = t.on_row(
+        &eg_row("c", T0 + 86 * S, -89.0, f64::NAN, 100.2, 0.0, [0.0, 0.0]),
+        None,
+        &ENV,
+        &mut meta,
+    );
+    assert_eq!(updates(&r), vec![("expired", d("0"))]);
+    assert!(t.positions.get("a").is_none() && t.positions.get("c").is_none());
+}
+
+#[tokio::test]
+async fn endgame_records_persist_with_a_balanced_ledger() {
+    let url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point at a disposable PostgreSQL database");
+    let pool = polygemy_engine::db::connect(&url, 2).await.unwrap();
+    polygemy_engine::db::migrate(&pool).await.unwrap();
+    let cid = format!(
+        "0x{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    sqlx::query("INSERT INTO markets (condition_id, validation_status) VALUES ($1, 'valid')")
+        .bind(&cid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let mut t = endgame_trader(&run);
+    let mut meta = HashMap::new();
+    let mut all = Vec::new();
+    for (i, sold) in [0.0, 0.0, 4.0, 20.0].iter().enumerate() {
+        all.extend(t.on_row(
+            &eg_row(
+                &cid,
+                T0 + i as i64 * S,
+                30.0 - i as f64,
+                0.99,
+                f64::NAN,
+                0.0,
+                [*sold, 0.0],
+            ),
+            None,
+            &ENV,
+            &mut meta,
+        ));
+    }
+    all.extend(t.settle(&cid, Outcome::Up, T0 + 300 * S));
+    store(&pool, "backtest", &run, &all).await.unwrap();
+    let (status, filled, tif): (String, Decimal, String) =
+        sqlx::query_as("SELECT status, filled_shares, time_in_force FROM orders WHERE run_id = $1")
+            .bind(&run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (status.as_str(), filled, tif.as_str()),
+        ("filled", d("10"), "POST_ONLY")
+    );
+    let unbalanced: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pnl_ledger_unbalanced WHERE txn LIKE $1")
+            .bind(format!("backtest:{run}:%"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unbalanced, 0);
+    let realized: Decimal = sqlx::query_scalar("SELECT realized FROM positions WHERE run_id = $1")
+        .bind(&run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(realized, d("0.10"));
 }

@@ -30,7 +30,7 @@ def conn():
 
 
 def seed_markets(conn, n=24, rows=60):
-    names = dataset.feature_names(conn, 2)
+    names = dataset.feature_names(conn, 3)
     ix = {n_: i for i, n_ in enumerate(names)}
     rng = np.random.default_rng(5)
     t0 = 1_660_000_000 + int(uuid.uuid4().int % 4000) * 3600
@@ -50,7 +50,7 @@ def seed_markets(conn, n=24, rows=60):
             for k, v in {"up_ask_px1": 0.55, "up_ask_sz1": 200, "up_bid_px1": 0.54, "up_bid_sz1": 200,
                          "down_ask_px1": 0.46, "down_ask_sz1": 200, "down_bid_px1": 0.45, "down_bid_sz1": 200}.items():
                 f[ix[k]] = float(v)
-            conn.execute("INSERT INTO feature_snapshots (ts, condition_id, feature_version, features, missing, quality, instance_id) VALUES (to_timestamp(%s), %s, 2, %s, 0, 'valid', 't')",
+            conn.execute("INSERT INTO feature_snapshots (ts, condition_id, feature_version, features, missing, quality, instance_id) VALUES (to_timestamp(%s), %s, 3, %s, 0, 'valid', 't')",
                          (start + i * 5, cid, f))
     conn.commit()
     return t0
@@ -59,7 +59,7 @@ def seed_markets(conn, n=24, rows=60):
 def test_walkforward_trains_registers_and_backtests_out_of_sample(conn, engine, tmp_path):
     t0 = seed_markets(conn)
     from datetime import datetime, timezone
-    df = dataset.build(conn, datetime.fromtimestamp(t0, timezone.utc), datetime.fromtimestamp(t0 + 24 * 300, timezone.utc), 2, stride_s=5)
+    df = dataset.build(conn, datetime.fromtimestamp(t0, timezone.utc), datetime.fromtimestamp(t0 + 24 * 300, timezone.utc), 3, stride_s=5)
     assert df["y_settlement"].notna().all() and len(df) == 24 * 60
     rep = backtest.walkforward(conn, df, engine, f"test-{uuid.uuid4().hex[:6]}", groups=("combined", "technical"), n_splits=2, min_train_markets=12,
                                engine_env={"DATABASE_URL": os.environ["TEST_DATABASE_URL"]})

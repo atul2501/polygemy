@@ -17,7 +17,7 @@ import psycopg
 
 from . import dataset, models
 
-FEATURE_VERSION = 2  # must match the engine's FEATURE_VERSION
+FEATURE_VERSION = 3  # must match the engine's FEATURE_VERSION
 
 
 def build(names: list[str]) -> dict:

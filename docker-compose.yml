@@ -90,6 +90,93 @@ services:
       timeout: 10s
       retries: 3
 
+  # Same engine for ETH 5-minute markets (profile `endgame`: docker compose --profile endgame up -d).
+  engine-eth:
+    <<: *engine
+    profiles: ["endgame"]
+    command: ["run"]
+    environment:
+      ASSET: eth
+      # The env file is written for BTC: restate everything asset-specific.
+      POLY_SERIES_SLUG: eth-up-or-down-5m
+      FEEDS_ENABLED: binance,coinbase,deribit,chainlink,polymarket
+      BINANCE_SYMBOL: ETHUSDT
+      COINBASE_PRODUCT: ETH-USD
+      DERIBIT_INSTRUMENT: "ETH-PERPETUAL"
+      DERIBIT_EXTRA_TICKERS: ""
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "polygemy-engine", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Same engine for SOL 5-minute markets (profile `endgame`: docker compose --profile endgame up -d).
+  engine-sol:
+    <<: *engine
+    profiles: ["endgame"]
+    command: ["run"]
+    environment:
+      ASSET: sol
+      # The env file is written for BTC: restate everything asset-specific.
+      POLY_SERIES_SLUG: sol-up-or-down-5m
+      FEEDS_ENABLED: binance,coinbase,chainlink,polymarket
+      BINANCE_SYMBOL: SOLUSDT
+      COINBASE_PRODUCT: SOL-USD
+      DERIBIT_INSTRUMENT: ""
+      DERIBIT_EXTRA_TICKERS: ""
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "polygemy-engine", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Same engine for DOGE 5-minute markets (profile `endgame`: docker compose --profile endgame up -d).
+  engine-doge:
+    <<: *engine
+    profiles: ["endgame"]
+    command: ["run"]
+    environment:
+      ASSET: doge
+      # The env file is written for BTC: restate everything asset-specific.
+      POLY_SERIES_SLUG: doge-up-or-down-5m
+      FEEDS_ENABLED: binance,coinbase,chainlink,polymarket
+      BINANCE_SYMBOL: DOGEUSDT
+      COINBASE_PRODUCT: DOGE-USD
+      DERIBIT_INSTRUMENT: ""
+      DERIBIT_EXTRA_TICKERS: ""
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "polygemy-engine", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   # API + dashboard. Loopback only: from the PC use `ssh -L 18000:127.0.0.1:8000 <vps>`.
   api:
     image: polygemy-api:${IMAGE_TAG:-dev}

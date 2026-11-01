@@ -158,7 +158,8 @@ impl Manager {
 
     /// Resume every non-terminal market from PostgreSQL.
     async fn recover(&mut self) -> Result<()> {
-        for (meta, state) in repo::load_open(&self.pool).await? {
+        let series = self.discovery.series_slug.clone();
+        for (meta, state) in repo::load_open(&self.pool, &series).await? {
             let validation = self.validate(&meta).await?;
             info!(
                 condition_id = meta.condition_id,
@@ -349,8 +350,8 @@ impl Manager {
                     Methodology::ChainlinkTwap60 => Stream::Twap60.feed(),
                     Methodology::ChainlinkSpot => Stream::Spot.feed(),
                 };
-                let s = repo::reference(&self.pool, feed, v.start_us, true, tol).await?;
-                let e = repo::reference(&self.pool, feed, v.end_us, false, tol).await?;
+                let s = repo::reference(&self.pool, &feed, v.start_us, true, tol).await?;
+                let e = repo::reference(&self.pool, &feed, v.end_us, false, tol).await?;
                 (s, e, computed_outcome(v, s, e))
             }
             _ => (None, None, None),
